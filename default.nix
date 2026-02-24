@@ -5,8 +5,8 @@
       name = "apple: enable interchange compression modifier";
       patch = (
         pkgs.fetchurl {
-          url = "https://github.com/oliverbestmann/linux-asahi/commit/0a625598c29a3703e40a76d2ad7e843e4839f6a6.patch";
-          hash = "sha256-iAkbMCOyqFxbvb1OWjbOIyYieTxBSmzA0qfOefUpdeY=";
+          url = "https://github.com/oliverbestmann/linux-asahi/commit/cdeaea63d0b59e2a33bf6fc43563556b4fe12ae6.patch";
+          hash = "sha256-Ro2LHuqEPyZDu8N/jpuJvbciutFZywb+ZtBbqm0Nsls=";
         }
       );
     }
