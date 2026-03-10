@@ -1,0 +1,116 @@
+From a49dfb8843b3ff7b0163d1ecfb0bc393d3c24c83 Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Sun, 8 Feb 2026 12:53:06 +0100
+Subject: [PATCH 3/4] hk: add support for interchange_compressed
+
+---
+ src/asahi/vulkan/hk_format.c     | 24 +++++++++++++++++++++++-
+ src/asahi/vulkan/hk_image.c      |  6 ++++--
+ src/asahi/vulkan/hk_image_view.c |  6 ++++++
+ 3 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/src/asahi/vulkan/hk_format.c b/src/asahi/vulkan/hk_format.c
+index 006e3cd05a4..6e65661474e 100644
+--- a/src/asahi/vulkan/hk_format.c
++++ b/src/asahi/vulkan/hk_format.c
+@@ -15,15 +15,32 @@
+ #include "hk_image.h"
+ #include "hk_physical_device.h"
+ 
++#include "layout.h"
+ #include "vk_enum_defines.h"
+ #include "vk_format.h"
+ 
+ uint64_t agx_best_modifiers[] = {
+    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
++   DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED,
+    DRM_FORMAT_MOD_APPLE_GPU_TILED,
+    DRM_FORMAT_MOD_LINEAR,
+ };
+ 
++static bool
++hk_allow_interchange_tiling(VkFormat vk_format)
++{
++   switch (vk_format) {
++   case VK_FORMAT_R8G8B8A8_UNORM:
++   case VK_FORMAT_B8G8R8A8_UNORM:
++   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++      return true;
++
++   default:
++      return false;
++   }
++}
++
+ static VkFormatFeatureFlags2
+ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
+                      VkFormat vk_format, const VkFormatProperties *props)
+@@ -35,10 +52,15 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
+    }
+ 
+    /* Don't advertise compression for the uncompressable */
+-   if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
++   if (ail_is_drm_modifier_compressed(mod) &&
+        !hk_can_compress_format(dev, vk_format))
+       return 0;
+ 
++   /* Only advertise interchange for some blessed formats */
++   if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED &&
++       !hk_allow_interchange_tiling(vk_format))
++      return 0;
++
+    if (mod == DRM_FORMAT_MOD_LINEAR)
+       return props->linearTilingFeatures;
+    else
+diff --git a/src/asahi/vulkan/hk_image.c b/src/asahi/vulkan/hk_image.c
+index 313655723df..fc9ee0a2ae1 100644
+--- a/src/asahi/vulkan/hk_image.c
++++ b/src/asahi/vulkan/hk_image.c
+@@ -749,6 +749,9 @@ modifier_get_score(uint64_t mod)
+ {
+    switch (mod) {
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
++      return 15;
++
++   case DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED:
+       return 10;
+ 
+    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
+@@ -777,8 +780,7 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
+    }
+ 
+    for (uint32_t i = 0; i < modifier_count; ++i) {
+-      if (!can_compress &&
+-          modifiers[i] == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED)
++      if (!can_compress && ail_is_drm_modifier_compressed(modifiers[i]))
+          continue;
+ 
+       uint32_t score = modifier_get_score(modifiers[i]);
+diff --git a/src/asahi/vulkan/hk_image_view.c b/src/asahi/vulkan/hk_image_view.c
+index 27e13e73832..cd7a561ca9a 100644
+--- a/src/asahi/vulkan/hk_image_view.c
++++ b/src/asahi/vulkan/hk_image_view.c
+@@ -343,6 +343,9 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
+          cfg.depth_linear = layers;
+          cfg.layer_stride_linear = layout->layer_stride_B - 0x80;
+          cfg.extended = true;
++      } else if (layout->tiling == AIL_TILING_INTERCHANGE) {
++         assert(layers == 1);
++         cfg.depth = ALIGN_POT(layout->width_px, 16) / 16;
+       } else {
+          assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
+          cfg.depth = layers;
+@@ -463,6 +466,9 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
+             cfg.depth_linear = layers;
+             cfg.layer_stride_linear = (layout->layer_stride_B - 0x80);
+             cfg.extended = true;
++         } else if (layout->tiling == AIL_TILING_INTERCHANGE) {
++            assert(layers == 1);
++            cfg.stride_in_tiles = ALIGN_POT(layout->width_px, 16) / 16;
+          } else {
+             assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
+             cfg.layers = layers;
+-- 
+2.53.0
+

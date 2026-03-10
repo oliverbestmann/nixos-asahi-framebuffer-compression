@@ -1,27 +1,33 @@
-{ pkgs, ... }:
+{ ... }:
 {
   boot.kernelPatches = [
     {
       name = "apple: enable interchange compression modifier";
-      patch = (
-        pkgs.fetchurl {
-          url = "https://github.com/oliverbestmann/linux-asahi/commit/cdeaea63d0b59e2a33bf6fc43563556b4fe12ae6.patch";
-          hash = "sha256-Ro2LHuqEPyZDu8N/jpuJvbciutFZywb+ZtBbqm0Nsls=";
-        }
-      );
+      patch = ./patches/linux/0001-drm-apple-support-interchange-compression.patch;
+    }
+    {
+      name = "apple: fixup: do not check pitch for alignment";
+      patch = ./patches/linux/0002-fixup-do-not-check-pitch-with-INTERCHANGE-modifier.patch;
     }
   ];
 
   nixpkgs.overlays = [
     (final: prev: {
       mesa = prev.mesa.overrideAttrs (
-        f: p: {
-          patches = p.patches ++ [
-            (pkgs.fetchpatch {
-              name = "mesa: enable interchange modifier";
-              url = "https://github.com/oliverbestmann/mesa/compare/90ac874f2e81c31551b6af516f4ce87aab37cfac~3...90ac874f2e81c31551b6af516f4ce87aab37cfac.patch";
-              hash = "sha256-LIrxmBYEYqQYDz600Kp2JJ+G+0B+QJvpsJxV/EmDqaA=";
-            })
+        _: pkg: {
+          patches = (pkg.patches or [ ]) ++ [
+            ./patches/mesa/0001-asahi-add-INTERCHANGE_COMPRESSED-modifier-for-testin.patch
+            ./patches/mesa/0002-asahi-add-support-for-interchange_compressed.patch
+            ./patches/mesa/0003-hk-add-support-for-interchange_compressed.patch
+            ./patches/mesa/0004-fixup-agx-adjust-stride-for-interchange.patch
+          ];
+        }
+      );
+
+      mutter = prev.mutter.overrideAttrs (
+        _: pkg: {
+          patches = (pkg.patches or [ ]) ++ [
+            ./patches/mutter/0001-backend-native-move-cursor-to-overlay-plane-49.4.patch
           ];
         }
       );

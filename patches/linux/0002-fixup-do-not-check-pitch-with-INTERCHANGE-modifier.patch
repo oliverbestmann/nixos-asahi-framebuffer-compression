@@ -1,0 +1,38 @@
+From 3ccde48f63cf85f632704002f23cf42d71c78f15 Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Tue, 10 Mar 2026 14:23:50 +0100
+Subject: [PATCH 2/2] fixup!: do not check pitch with INTERCHANGE modifier
+
+Signed-off-by: Oliver Bestmann <oliver.bestmann@googlemail.com>
+---
+ drivers/gpu/drm/apple/plane.c | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/apple/plane.c b/drivers/gpu/drm/apple/plane.c
+index 9df3ad833fd7..a401bc922891 100644
+--- a/drivers/gpu/drm/apple/plane.c
++++ b/drivers/gpu/drm/apple/plane.c
+@@ -128,12 +128,14 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
+ 		return -EINVAL;
+ 	}
+ 
+-	/*
+-	 * Pitches have to be 64-byte aligned.
+-	 */
+-	for (u32 i = 0; i < new_plane_state->fb->format->num_planes; i++)
+-		if (new_plane_state->fb->pitches[i] & 63)
+-			return -EINVAL;
++	if (new_plane_state->fb->modifier != DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED) {
++		/*
++		 * Pitches have to be 64-byte aligned for non-tiled modifiers.
++		 */
++		for (u32 i = 0; i < new_plane_state->fb->format->num_planes; i++)
++			if (new_plane_state->fb->pitches[i] & 63)
++				return -EINVAL;
++	}
+ 
+ 	/*
+ 	 * FIXME: dcp can currently only use multi-planar buffers using the same
+-- 
+2.53.0
+

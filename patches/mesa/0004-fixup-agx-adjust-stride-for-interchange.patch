@@ -1,0 +1,47 @@
+From d64e8e1f500eccfbaa18a6bb358f068a87194df3 Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Sun, 8 Mar 2026 10:16:38 +0100
+Subject: [PATCH 4/4] fixup!: agx: adjust stride for interchange
+
+---
+ src/asahi/layout/layout.h | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/src/asahi/layout/layout.h b/src/asahi/layout/layout.h
+index ab91708748a..74a6f67ce65 100644
+--- a/src/asahi/layout/layout.h
++++ b/src/asahi/layout/layout.h
+@@ -200,18 +200,26 @@ ail_get_linear_stride_B(const struct ail_layout *layout, ASSERTED uint8_t level)
+  * hardware, only strided linear images have an associated stride, there is no
+  * natural stride associated with nonlinear images. However, various clients
+  * assert that the stride is valid for the image if it were linear (even if it
+- * is in fact not linear). In those cases, by convention we use the minimum
+- * valid such stride.
++ * is in fact not linear). In those cases, by convention we use a stride
++ * greather than or equal to the minimum valid stride.
+  */
+ static inline uint32_t
+ ail_get_wsi_stride_B(const struct ail_layout *layout, unsigned level)
+ {
+    assert(level == 0 && "Mipmaps cannot be shared as WSI");
+ 
+-   if (layout->tiling == AIL_TILING_LINEAR)
++   switch (layout->tiling) {
++   case AIL_TILING_LINEAR:
+       return ail_get_linear_stride_B(layout, level);
+-   else
++
++   case AIL_TILING_INTERCHANGE: {
++      uint32_t stride = util_format_get_stride(layout->format, layout->width_px);
++      return ALIGN_POT(stride, 64);
++   }
++
++   default:
+       return util_format_get_stride(layout->format, layout->width_px);
++   }
+ }
+ 
+ static inline uint32_t
+-- 
+2.53.0
+
