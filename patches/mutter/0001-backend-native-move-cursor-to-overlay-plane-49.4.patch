@@ -1,4 +1,4 @@
-From 8397c12738b38a60b1a03c1ade81b3b4a98c6534 Mon Sep 17 00:00:00 2001
+From 24507e546392fb2fac822a4f15b1a67d7e8a6621 Mon Sep 17 00:00:00 2001
 From: Oliver Bestmann <oliver.bestmann@googlemail.com>
 Date: Tue, 10 Mar 2026 19:26:03 +0100
 Subject: [PATCH] backend/native: move cursor to overlay plane.
@@ -15,52 +15,57 @@ cursor and screen has always at least the required size.
 
 Signed-off-by: Oliver Bestmann <oliver.bestmann@googlemail.com>
 ---
- .../native/meta-cursor-renderer-native.c      | 30 ++++++++++++---
- src/backends/native/meta-kms-impl-device.c    |  6 ++-
- src/backends/native/meta-kms-plane.c          | 38 +++++++++++++++++--
- 3 files changed, 63 insertions(+), 11 deletions(-)
+ .../native/meta-cursor-renderer-native.c      | 59 +++++++++++++++++--
+ src/backends/native/meta-kms-impl-device.c    |  6 +-
+ src/backends/native/meta-kms-plane.c          | 38 +++++++++++-
+ 3 files changed, 92 insertions(+), 11 deletions(-)
 
 diff --git a/src/backends/native/meta-cursor-renderer-native.c b/src/backends/native/meta-cursor-renderer-native.c
-index 949f922d76..d5676ed322 100644
+index 949f922d76..d344ade957 100644
 --- a/src/backends/native/meta-cursor-renderer-native.c
 +++ b/src/backends/native/meta-cursor-renderer-native.c
-@@ -779,6 +779,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+@@ -779,6 +779,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
                                         CoglPixelFormat           dst_format,
                                         int                       dst_width,
                                         int                       dst_height,
-+                                       int                       dst_padding,
++                                       int                       cursor_x,
++                                       int                       cursor_y,
++                                       int                       cursor_width,
++                                       int                       cursor_height,
                                         GError                  **error)
  {
    MetaCursorRendererNativePrivate *priv =
-@@ -791,6 +792,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+@@ -791,6 +795,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
    g_autoptr (CoglOffscreen) offscreen = NULL;
    g_autoptr (CoglPipeline) pipeline = NULL;
    ClutterColorState *color_state;
-+  int min_size = dst_padding * 2 + 1;
++  float dst_x0, dst_y0, dst_x1, dst_y1;
  
    src_texture = cogl_texture_2d_new_from_data (cogl_context,
                                                 width, height,
-@@ -801,7 +803,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+@@ -801,7 +806,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
    if (!src_texture)
      return NULL;
  
 -  if (dst_width < 1 || dst_height < 1)
-+  if (dst_width < min_size || dst_height < min_size)
++  if (dst_width < 32 || dst_height < 32)
      {
        g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
                     "Invalid size for cursor texture %d x %d",
-@@ -809,6 +811,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+@@ -809,6 +814,12 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
        return NULL;
      }
  
-+  /* Center the cursor within padded region */
-+  float dst_x = 1 - 2 * dst_padding / (float)(dst_width);
-+  float dst_y = 1 - 2 * dst_padding / (float)(dst_height);
++  /* Calcualte target coordinates for cursor */
++  dst_x0 = 2 * cursor_x / (float)(dst_width) - 1;
++  dst_y0 = 2 * cursor_y / (float)(dst_height) - 1;
++  dst_x1 = 2 * (cursor_x + cursor_width) / (float)(dst_width) - 1;
++  dst_y1 = 2 * (cursor_y + cursor_height) / (float)(dst_height) - 1;
 +
    dst_texture = cogl_texture_2d_new_with_format (cogl_context,
                                                   dst_width,
                                                   dst_height,
-@@ -838,10 +844,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+@@ -838,10 +849,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
                              0.0f, 0.0f, 0.0f, 0.0f);
    cogl_framebuffer_draw_textured_rectangle (COGL_FRAMEBUFFER (offscreen),
                                              pipeline,
@@ -68,14 +73,14 @@ index 949f922d76..d5676ed322 100644
 -                                            1.0f, 1.0f,
 -                                            0.0f, 1.0f,
 -                                            1.0f, 0.0f);
-+                                            -dst_x, -dst_y,
-+                                            dst_x, dst_y,
-+                                            0.0f, 1.0,
-+                                            1.0, 0.0f);
++                                            dst_x0, -dst_y0,
++                                            dst_x1, -dst_y1,
++                                            0.0f, 0.0,
++                                            1.0, 1.0f);
  
    return COGL_TEXTURE (g_steal_pointer (&dst_texture));
  }
-@@ -968,11 +974,22 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+@@ -968,11 +979,43 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
                                           &hot_x, &hot_y);
    hotspot = GRAPHENE_POINT_INIT (hot_x, hot_y);
  
@@ -91,19 +96,43 @@ index 949f922d76..d5676ed322 100644
        gbm_format != cursor_renderer_gpu_data->drm_format ||
        !clutter_color_state_equals (cursor_color_state, target_color_state))
      {
-+      crtc_dst_width += crtc_cursor_padding * 2;
-+      crtc_dst_height += crtc_cursor_padding * 2;
-+      hotspot.x += crtc_cursor_padding;
-+      hotspot.y += crtc_cursor_padding;
++      int crtc_cursor_x = 0, crtc_cursor_y = 0;
++      int crtc_cursor_width = crtc_dst_width;
++      int crtc_cursor_height = crtc_dst_height;
++
++      if (hot_x < crtc_cursor_padding) {
++        /* shift image to the right to ensure padding before hotspot */
++        int shift = crtc_cursor_padding - hot_x;
++        crtc_cursor_x += shift;
++        crtc_dst_width += shift;
++        hot_x += shift;
++      }
++
++      if (hot_y < crtc_cursor_padding) {
++        /* shift image down to ensure padding before hotspot */
++        int shift = crtc_cursor_padding - hot_y;
++        crtc_cursor_y += shift;
++        crtc_dst_height += shift;
++        hot_y += shift;
++      }
++
++      hotspot = GRAPHENE_POINT_INIT (hot_x, hot_y);
++
++      /* extend size to ensure padding after hotspot */
++      crtc_dst_width = MAX(crtc_dst_width, hot_x + crtc_cursor_padding);
++      crtc_dst_height = MAX(crtc_dst_height, hot_y + crtc_cursor_padding);
 +
        const MetaFormatInfo *format_info;
        g_autoptr (GError) error = NULL;
        g_autoptr (CoglTexture) texture = NULL;
-@@ -996,6 +1013,7 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+@@ -996,6 +1039,10 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
                                                         cursor_renderer_gpu_data->cogl_format,
                                                         crtc_dst_width,
                                                         crtc_dst_height,
-+                                                       crtc_cursor_padding,
++                                                       crtc_cursor_x,
++                                                       crtc_cursor_y,
++                                                       crtc_cursor_width,
++                                                       crtc_cursor_height,
                                                         &error);
        if (!texture)
          {
