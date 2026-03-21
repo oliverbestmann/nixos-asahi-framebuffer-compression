@@ -1,0 +1,368 @@
+From 01986a3bd349897b2c4f4c576985c0acc6a1653e Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Sat, 21 Mar 2026 09:27:08 +0100
+Subject: [PATCH 2/3] backend/native: Use less padding on a single monitor
+ setup.
+
+---
+ .../native/meta-cursor-renderer-native.c      | 156 ++++++++++++------
+ src/backends/native/meta-kms-cursor-manager.c |   5 +-
+ 2 files changed, 107 insertions(+), 54 deletions(-)
+
+diff --git a/src/backends/native/meta-cursor-renderer-native.c b/src/backends/native/meta-cursor-renderer-native.c
+index 62d8afcb1c..8d5cb81da3 100644
+--- a/src/backends/native/meta-cursor-renderer-native.c
++++ b/src/backends/native/meta-cursor-renderer-native.c
+@@ -130,7 +130,8 @@ static gboolean
+ realize_cursor_sprite_for_crtc (MetaCursorRenderer *renderer,
+                                 MetaCrtcKms        *crtc_kms,
+                                 ClutterColorState  *target_color_state,
+-                                ClutterCursor      *cursor);
++                                ClutterCursor      *cursor,
++                                gboolean            single_crtc);
+ 
+ static void
+ meta_cursor_renderer_native_invalidate_gpu_state (MetaCursorRendererNative *native);
+@@ -375,6 +376,7 @@ meta_cursor_renderer_native_update_cursor (MetaCursorRenderer *cursor_renderer,
+   MetaKms *kms = meta_backend_native_get_kms (backend_native);
+   MetaKmsCursorManager *kms_cursor_manager = meta_kms_get_cursor_manager (kms);
+   gboolean cursor_changed, cursor_hw_managed = FALSE;
++  gboolean single_view;
+   GList *views;
+   GList *l;
+ 
+@@ -398,6 +400,8 @@ meta_cursor_renderer_native_update_cursor (MetaCursorRenderer *cursor_renderer,
+   views = meta_renderer_get_views (renderer);
+   g_list_foreach (views, (GFunc) ensure_cursor_stage_view, NULL);
+ 
++  single_view = views && views->next == NULL;
++
+   for (l = views; l; l = l->next)
+     {
+       MetaStageView *view = l->data;
+@@ -430,7 +434,8 @@ meta_cursor_renderer_native_update_cursor (MetaCursorRenderer *cursor_renderer,
+               has_hw_cursor = realize_cursor_sprite_for_crtc (cursor_renderer,
+                                                               META_CRTC_KMS (crtc),
+                                                               target_color_state,
+-                                                              cursor);
++                                                              cursor,
++                                                              single_view);
+ 
+               cursor_stage_view->is_hw_cursor_valid = TRUE;
+             }
+@@ -757,7 +762,6 @@ supports_exact_cursor_size (MetaCrtcKms *crtc_kms,
+ static gboolean
+ load_cursor_sprite_gbm_buffer_for_crtc (MetaCursorRendererNative *native,
+                                         MetaCrtcKms              *crtc_kms,
+-                                        ClutterCursor            *cursor,
+                                         uint8_t                  *pixels,
+                                         uint                      width,
+                                         uint                      height,
+@@ -831,17 +835,14 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+                                        ClutterCursor            *cursor,
+                                        uint8_t                  *pixels,
+                                        CoglPixelFormat           pixel_format,
+-                                       int                       width,
+-                                       int                       height,
+-                                       int                       rowstride,
++                                       int                       in_width,
++                                       int                       in_height,
++                                       int                       in_rowstride,
+                                        const graphene_matrix_t  *matrix,
+                                        CoglPixelFormat           dst_format,
+                                        int                       dst_width,
+                                        int                       dst_height,
+-                                       int                       cursor_x,
+-                                       int                       cursor_y,
+-                                       int                       cursor_width,
+-                                       int                       cursor_height,
++                                       MtkRectangle              dst_area,
+                                        GError                  **error)
+ {
+   MetaCursorRendererNativePrivate *priv =
+@@ -857,15 +858,15 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+   float dst_x0, dst_y0, dst_x1, dst_y1;
+ 
+   src_texture = cogl_texture_2d_new_from_data (cogl_context,
+-                                               width, height,
++                                               in_width, in_height,
+                                                pixel_format,
+-                                               rowstride,
++                                               in_rowstride,
+                                                pixels,
+                                                error);
+   if (!src_texture)
+     return NULL;
+ 
+-  if (dst_width < 32 || dst_height < 32)
++  if (dst_width < 1 || dst_height < 1)
+     {
+       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "Invalid size for cursor texture %d x %d",
+@@ -874,10 +875,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+     }
+ 
+   /* Calcualte target coordinates for cursor */
+-  dst_x0 = 2 * cursor_x / (float)(dst_width) - 1;
+-  dst_y0 = 2 * cursor_y / (float)(dst_height) - 1;
+-  dst_x1 = 2 * (cursor_x + cursor_width) / (float)(dst_width) - 1;
+-  dst_y1 = 2 * (cursor_y + cursor_height) / (float)(dst_height) - 1;
++  dst_x0 = 2 * dst_area.x / (float)(dst_width) - 1;
++  dst_y0 = 2 * dst_area.y / (float)(dst_height) - 1;
++  dst_x1 = 2 * (dst_area.x + dst_area.width) / (float)(dst_width) - 1;
++  dst_y1 = 2 * (dst_area.y + dst_area.height) / (float)(dst_height) - 1;
+ 
+   dst_texture = cogl_texture_2d_new_with_format (cogl_context,
+                                                  dst_width,
+@@ -916,6 +917,64 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+   return COGL_TEXTURE (g_steal_pointer (&dst_texture));
+ }
+ 
++static MtkRectangle
++calculate_cursor_shift_and_extend(int      *crtc_dst_width,
++                                  int      *crtc_dst_height,
++                                  int      *hot_x,
++                                  int      *hot_y,
++                                  const int padding,
++                                  gboolean  single_crtc)
++{
++  MtkRectangle cursor_area = MTK_RECTANGLE_INIT (0, 0, *crtc_dst_width, *crtc_dst_height);
++
++  /*
++  If limited to a single crtc, the cursors hot spot can not leave the crtc. Due to this
++  fact padding can be applied around the hotspot only while still ensuring, that the
++  intersection with the screen is at least as large as the padding. This reduces the size
++  of the overlay.
++
++  In a multi crtc setup (e.g. multiple screens) a cursors hotspot can leave one screen
++  until the cursor has fully left the screen. To handle this case, the cursor must be
++  padded uniformly with full padding.
++  */
++  if (single_crtc)
++    {
++      /* only add padding around the hotspot */
++      if (*hot_x < padding)
++        {
++          int shift = padding - *hot_x;
++          *hot_x += shift;
++          cursor_area.x += shift;
++          *crtc_dst_width += shift;
++        }
++
++      if (*hot_y < padding)
++        {
++          int shift = padding - *hot_y;
++          *hot_y += shift;
++          cursor_area.y += shift;
++          *crtc_dst_height += shift;
++        }
++
++      *crtc_dst_width = *hot_x + MAX (*crtc_dst_width - *hot_x, padding);
++      *crtc_dst_height = *hot_y + MAX (*crtc_dst_height - *hot_y, padding);
++    }
++  else
++    {
++      /* extend the cursors surface uniformly to include padding */
++      cursor_area.x += padding;
++      cursor_area.y += padding;
++      *crtc_dst_width += 2 * padding;
++      *crtc_dst_height += 2 * padding;
++
++      /* and shift the hotspot */
++      *hot_x += padding;
++      *hot_y += padding;
++    }
++
++  return cursor_area;
++}
++
+ static gboolean
+ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                            MetaCrtcKms              *crtc_kms,
+@@ -925,7 +984,8 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                            int                       width,
+                                            int                       height,
+                                            int                       rowstride,
+-                                           uint32_t                  gbm_format)
++                                           uint32_t                  gbm_format,
++                                           gboolean                  single_crtc)
+ {
+   MetaCursorRendererNativePrivate *priv =
+     meta_cursor_renderer_native_get_instance_private (native);
+@@ -1044,33 +1104,23 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+       gbm_format != cursor_renderer_gpu_data->drm_format ||
+       clutter_color_state_needs_mapping (cursor_color_state, target_color_state))
+     {
+-      int crtc_cursor_x, crtc_cursor_y;
+-      int crtc_cursor_width;
+-      int crtc_cursor_height;
+-
+-      /* shift the target rectangle into the middle of the extended rectangle */
+-      crtc_cursor_x = crtc_cursor_padding;
+-      crtc_cursor_y = crtc_cursor_padding;
+-      crtc_cursor_width = crtc_dst_width;
+-      crtc_cursor_height = crtc_dst_height;
+-
+-      /* also shift the hotspot */
+-      hot_x += crtc_cursor_padding;
+-      hot_y += crtc_cursor_padding;
+-
+-      /* add padding to the cursors surface */
+-      crtc_dst_width += 2 * crtc_cursor_padding;
+-      crtc_dst_height += 2 * crtc_cursor_padding;
+-
+-      hotspot = GRAPHENE_POINT_INIT (hot_x, hot_y);
+-
+       const MetaFormatInfo *format_info;
+       g_autoptr (GError) error = NULL;
+       g_autoptr (CoglTexture) texture = NULL;
+       g_autofree uint8_t *cursor_data = NULL;
++      MtkRectangle crtc_dst_area;
+       int bpp;
+       int cursor_rowstride;
+ 
++      crtc_dst_area = calculate_cursor_shift_and_extend (&crtc_dst_width,
++                                                         &crtc_dst_height,
++                                                         &hot_x,
++                                                         &hot_y,
++                                                         crtc_cursor_padding,
++                                                         single_crtc);
++
++      hotspot = GRAPHENE_POINT_INIT (hot_x, hot_y);
++
+       format_info = meta_format_info_from_drm_format (gbm_format);
+       if (!format_info)
+         return FALSE;
+@@ -1087,10 +1137,7 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                                        cursor_renderer_gpu_data->cogl_format,
+                                                        crtc_dst_width,
+                                                        crtc_dst_height,
+-                                                       crtc_cursor_x,
+-                                                       crtc_cursor_y,
+-                                                       crtc_cursor_width,
+-                                                       crtc_cursor_height,
++                                                       crtc_dst_area,
+                                                        &error);
+       if (!texture)
+         {
+@@ -1111,7 +1158,6 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+       retval =
+         load_cursor_sprite_gbm_buffer_for_crtc (native,
+                                                 crtc_kms,
+-                                                cursor,
+                                                 cursor_data,
+                                                 crtc_dst_width,
+                                                 crtc_dst_height,
+@@ -1124,7 +1170,6 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+     {
+       retval = load_cursor_sprite_gbm_buffer_for_crtc (native,
+                                                        crtc_kms,
+-                                                       cursor,
+                                                        data,
+                                                        width,
+                                                        height,
+@@ -1141,7 +1186,8 @@ static gboolean
+ realize_cursor_sprite_from_wl_buffer_for_crtc (MetaCursorRenderer *renderer,
+                                                MetaCrtcKms        *crtc_kms,
+                                                ClutterColorState  *target_color_state,
+-                                               MetaCursorWayland  *cursor_wayland)
++                                               MetaCursorWayland  *cursor_wayland,
++                                               gboolean            single_crtc)
+ {
+   MetaCursorRendererNative *native = META_CURSOR_RENDERER_NATIVE (renderer);
+   MetaCursorRendererNativePrivate *priv =
+@@ -1150,7 +1196,7 @@ realize_cursor_sprite_from_wl_buffer_for_crtc (MetaCursorRenderer *renderer,
+   MetaGpu *gpu = meta_crtc_get_gpu (META_CRTC (crtc_kms));
+   MetaGpuKms *gpu_kms = META_GPU_KMS (gpu);
+   CoglTexture *texture;
+-  uint width, height;
++  int width, height;
+   MetaWaylandBuffer *buffer;
+   struct wl_shm_buffer *shm_buffer;
+ 
+@@ -1196,7 +1242,8 @@ realize_cursor_sprite_from_wl_buffer_for_crtc (MetaCursorRenderer *renderer,
+                                                           width,
+                                                           height,
+                                                           rowstride,
+-                                                          gbm_format);
++                                                          gbm_format,
++                                                          single_crtc);
+ 
+       wl_shm_buffer_end_access (shm_buffer);
+ 
+@@ -1288,7 +1335,8 @@ static gboolean
+ realize_cursor_sprite_from_xcursor_for_crtc (MetaCursorRenderer *renderer,
+                                              MetaCrtcKms        *crtc_kms,
+                                              ClutterColorState  *target_color_state,
+-                                             MetaCursorXcursor  *cursor_xcursor)
++                                             MetaCursorXcursor  *cursor_xcursor,
++                                             gboolean            single_crtc)
+ {
+   MetaCursorRendererNative *native = META_CURSOR_RENDERER_NATIVE (renderer);
+   ClutterCursor *cursor = CLUTTER_CURSOR (cursor_xcursor);
+@@ -1304,14 +1352,16 @@ realize_cursor_sprite_from_xcursor_for_crtc (MetaCursorRenderer *renderer,
+                                                     xc_image->width,
+                                                     xc_image->height,
+                                                     xc_image->width * 4,
+-                                                    GBM_FORMAT_ARGB8888);
++                                                    GBM_FORMAT_ARGB8888,
++                                                    single_crtc);
+ }
+ 
+ static gboolean
+ realize_cursor_sprite_for_crtc (MetaCursorRenderer *renderer,
+                                 MetaCrtcKms        *crtc_kms,
+                                 ClutterColorState  *target_color_state,
+-                                ClutterCursor      *cursor)
++                                ClutterCursor      *cursor,
++                                gboolean            single_crtc)
+ {
+   MetaKmsCrtc *kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
+   MetaKmsDevice *kms_device = meta_kms_crtc_get_device (kms_crtc);
+@@ -1330,7 +1380,8 @@ realize_cursor_sprite_for_crtc (MetaCursorRenderer *renderer,
+       return realize_cursor_sprite_from_xcursor_for_crtc (renderer,
+                                                           crtc_kms,
+                                                           target_color_state,
+-                                                          cursor_xcursor);
++                                                          cursor_xcursor,
++                                                          single_crtc);
+     }
+   else if (META_IS_CURSOR_WAYLAND (cursor))
+     {
+@@ -1339,7 +1390,8 @@ realize_cursor_sprite_for_crtc (MetaCursorRenderer *renderer,
+       return realize_cursor_sprite_from_wl_buffer_for_crtc (renderer,
+                                                             crtc_kms,
+                                                             target_color_state,
+-                                                            cursor_wayland);
++                                                            cursor_wayland,
++                                                            single_crtc);
+     }
+   else
+     {
+diff --git a/src/backends/native/meta-kms-cursor-manager.c b/src/backends/native/meta-kms-cursor-manager.c
+index 97481eb5ba..2497b9f31b 100644
+--- a/src/backends/native/meta-kms-cursor-manager.c
++++ b/src/backends/native/meta-kms-cursor-manager.c
+@@ -270,6 +270,7 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+ {
+   MetaKmsCrtc *crtc = crtc_state_impl->crtc;
+   MetaKmsDevice *device = meta_kms_crtc_get_device (crtc);
++  MetaKmsDeviceFlag device_flags = meta_kms_device_get_flags (device);
+   int crtc_x, crtc_y, crtc_width, crtc_height;
+   int buffer_width, buffer_height;
+   graphene_rect_t cursor_rect;
+@@ -300,9 +301,9 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+   };
+ 
+   int padding = 0;
+-  if (meta_kms_device_get_flags (device) & META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
++  if (device_flags & META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
+     {
+-      /* TODO get padding from caps */
++      /* need to have at least 32px visible on the screen at all times */
+       padding = 32;
+     }
+ 
+-- 
+2.53.0
+

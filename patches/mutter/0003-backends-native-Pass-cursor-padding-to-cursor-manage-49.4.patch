@@ -1,0 +1,175 @@
+From 6a0dfa9d1980701b457acb94e283c1c164b9928e Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Sat, 21 Mar 2026 14:30:42 +0100
+Subject: [PATCH 3/3] backends/native: Pass cursor padding to cursor-manager.
+
+The CursorManager needs to know the padding requirements of the cursor to hide the cursor in a multicrtc setup, once the unpadded area leaves the crtcs bounds.
+---
+ .../native/meta-cursor-renderer-native.c      | 18 ++++++++-----
+ src/backends/native/meta-kms-cursor-manager.c | 26 +++++++++----------
+ src/backends/native/meta-kms-cursor-manager.h |  3 ++-
+ 3 files changed, 26 insertions(+), 21 deletions(-)
+
+diff --git a/src/backends/native/meta-cursor-renderer-native.c b/src/backends/native/meta-cursor-renderer-native.c
+index fc0be52cb7..800ab87c70 100644
+--- a/src/backends/native/meta-cursor-renderer-native.c
++++ b/src/backends/native/meta-cursor-renderer-native.c
+@@ -424,7 +424,8 @@ meta_cursor_renderer_native_update_cursor (MetaCursorRenderer *cursor_renderer,
+                                                      kms_crtc,
+                                                      NULL,
+                                                      MTK_MONITOR_TRANSFORM_NORMAL,
+-                                                     NULL);
++                                                     NULL,
++                                                     0);
+             }
+         }
+     }
+@@ -721,7 +722,8 @@ load_cursor_sprite_gbm_buffer_for_crtc (MetaCursorRendererNative *native,
+                                         int                       rowstride,
+                                         graphene_point_t         *hotspot,
+                                         MtkMonitorTransform       transform,
+-                                        uint32_t                  gbm_format)
++                                        uint32_t                  gbm_format,
++                                        int                       padding)
+ {
+   MetaCursorRendererNativePrivate *priv =
+     meta_cursor_renderer_native_get_instance_private (native);
+@@ -778,7 +780,8 @@ load_cursor_sprite_gbm_buffer_for_crtc (MetaCursorRendererNative *native,
+                                          kms_crtc,
+                                          buffer,
+                                          transform,
+-                                         hotspot);
++                                         hotspot,
++                                         padding);
+   return TRUE;
+ }
+ 
+@@ -1119,7 +1122,8 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                                 cursor_rowstride,
+                                                 &hotspot,
+                                                 relative_transform,
+-                                                cursor_renderer_gpu_data->drm_format);
++                                                cursor_renderer_gpu_data->drm_format,
++                                                crtc_cursor_padding);
+     }
+   else
+     {
+@@ -1132,7 +1136,8 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                                        rowstride,
+                                                        &hotspot,
+                                                        MTK_MONITOR_TRANSFORM_NORMAL,
+-                                                       cursor_renderer_gpu_data->drm_format);
++                                                       cursor_renderer_gpu_data->drm_format,
++                                                       0);
+     }
+ 
+   return retval;
+@@ -1283,7 +1288,8 @@ realize_cursor_sprite_from_wl_buffer_for_crtc (MetaCursorRenderer      *renderer
+                                              kms_crtc,
+                                              META_DRM_BUFFER (buffer_gbm),
+                                              MTK_MONITOR_TRANSFORM_NORMAL,
+-                                             &GRAPHENE_POINT_INIT (hot_x, hot_y));
++                                             &GRAPHENE_POINT_INIT (hot_x, hot_y),
++                                             0);
+ 
+       return TRUE;
+     }
+diff --git a/src/backends/native/meta-kms-cursor-manager.c b/src/backends/native/meta-kms-cursor-manager.c
+index 462d075f28..658a4c8c30 100644
+--- a/src/backends/native/meta-kms-cursor-manager.c
++++ b/src/backends/native/meta-kms-cursor-manager.c
+@@ -54,6 +54,7 @@ typedef struct _CrtcStateImpl
+   MtkMonitorTransform transform;
+   MetaDrmBuffer *buffer;
+   graphene_point_t hotspot;
++  int cursor_padding;
+ 
+   gboolean cursor_invalidated;
+   gboolean force_update;
+@@ -267,11 +268,9 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+                        float                   y,
+                        graphene_rect_t        *out_cursor_rect)
+ {
+-  MetaKmsCrtc *crtc = crtc_state_impl->crtc;
+-  MetaKmsDevice *device = meta_kms_crtc_get_device (crtc);
+-  MetaKmsDeviceFlag device_flags = meta_kms_device_get_flags (device);
+   int crtc_x, crtc_y, crtc_width, crtc_height;
+   int buffer_width, buffer_height;
++  int cursor_padding;
+   graphene_rect_t cursor_rect;
+ 
+   crtc_x = (int) ((x - crtc_state_impl->layout.origin.x) * crtc_state_impl->scale);
+@@ -299,17 +298,12 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+     },
+   };
+ 
+-  int padding = 0;
+-  if (device_flags & META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
+-    {
+-      /* need to have at least 32px visible on the screen at all times */
+-      padding = 32;
+-    }
++  cursor_padding = crtc_state_impl->cursor_padding;
+ 
+-  if (cursor_rect.origin.x + cursor_rect.size.width - padding > 0.0 &&
+-      cursor_rect.origin.y + cursor_rect.size.height - padding > 0.0 &&
+-      cursor_rect.origin.x + padding < crtc_width &&
+-      cursor_rect.origin.y + padding < crtc_height)
++  if (cursor_rect.origin.x + cursor_rect.size.width - cursor_padding > 0.0 &&
++      cursor_rect.origin.y + cursor_rect.size.height - cursor_padding > 0.0 &&
++      cursor_rect.origin.x + cursor_padding < crtc_width &&
++      cursor_rect.origin.y + cursor_padding < crtc_height)
+     {
+       if (out_cursor_rect)
+         *out_cursor_rect = cursor_rect;
+@@ -748,6 +742,7 @@ typedef struct
+   MetaDrmBuffer *buffer;
+   MtkMonitorTransform transform;
+   graphene_point_t hotspot;
++  int padding;
+ } UpdateSpriteData;
+ 
+ static gpointer
+@@ -771,6 +766,7 @@ update_sprite_in_impl (MetaThreadImpl  *thread_impl,
+   old_buffer = g_steal_pointer (&crtc_state_impl->buffer);
+   crtc_state_impl->buffer = g_steal_pointer (&data->buffer);
+   crtc_state_impl->transform = data->transform;
++  crtc_state_impl->cursor_padding = data->padding;
+   crtc_state_impl->hotspot = data->hotspot;
+   crtc_state_impl->cursor_invalidated = TRUE;
+ 
+@@ -794,7 +790,8 @@ meta_kms_cursor_manager_update_sprite (MetaKmsCursorManager   *cursor_manager,
+                                        MetaKmsCrtc            *crtc,
+                                        MetaDrmBuffer          *buffer,
+                                        MtkMonitorTransform     transform,
+-                                       const graphene_point_t *hotspot)
++                                       const graphene_point_t *hotspot,
++                                       int                     padding)
+ {
+   UpdateSpriteData *data;
+ 
+@@ -802,6 +799,7 @@ meta_kms_cursor_manager_update_sprite (MetaKmsCursorManager   *cursor_manager,
+   data->crtc = crtc;
+   data->buffer = buffer ? g_object_ref (buffer) : NULL;
+   data->transform = transform;
++  data->padding = padding;
+   if (hotspot)
+     data->hotspot = *hotspot;
+ 
+diff --git a/src/backends/native/meta-kms-cursor-manager.h b/src/backends/native/meta-kms-cursor-manager.h
+index 5bfa5cadb2..320091daa9 100644
+--- a/src/backends/native/meta-kms-cursor-manager.h
++++ b/src/backends/native/meta-kms-cursor-manager.h
+@@ -55,7 +55,8 @@ void meta_kms_cursor_manager_update_sprite (MetaKmsCursorManager   *cursor_manag
+                                             MetaKmsCrtc            *crtc,
+                                             MetaDrmBuffer          *buffer,
+                                             MtkMonitorTransform     transform,
+-                                            const graphene_point_t *hotspot);
++                                            const graphene_point_t *hotspot,
++                                            int                     padding);
+ 
+ META_EXPORT_TEST
+ void meta_kms_cursor_manager_update_crtc_layout (MetaKmsCursorManager *cursor_manager,
+-- 
+2.53.0
+

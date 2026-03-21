@@ -1,0 +1,368 @@
+From 73a68b15d2283f40395491235a591ef7bfaa750d Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Tue, 10 Mar 2026 19:26:03 +0100
+Subject: [PATCH 1/3] backends/native: Move cursor to overlay plane.
+
+Overlay planes on apple hardware can not be exposed as cursor planes
+due to them having some limitations. Because of that, mutter is not
+able to take advantage of those planes to enable hardware compositing
+for the cursor. The most relevant restriction is that at least 32x32px
+of the overlay must be visible on the screen, otherwise the dcp crashes.
+
+This hack makes the drm overlay planes available as cursor planes. It
+then adds transparent padding to the cursor, so that the intersection between
+cursor and screen has always at least the required size.
+
+Signed-off-by: Oliver Bestmann <oliver.bestmann@googlemail.com>
+---
+ src/backends/native/meta-crtc-kms.c           | 38 +++++++---
+ .../native/meta-cursor-renderer-native.c      | 76 +++++++++++++++++--
+ src/backends/native/meta-kms-cursor-manager.c | 21 ++++-
+ src/backends/native/meta-kms-device.c         | 12 ++-
+ src/backends/native/meta-kms-types.h          |  1 +
+ 5 files changed, 124 insertions(+), 24 deletions(-)
+
+diff --git a/src/backends/native/meta-crtc-kms.c b/src/backends/native/meta-crtc-kms.c
+index f65ca5607f..eaa73d7bad 100644
+--- a/src/backends/native/meta-crtc-kms.c
++++ b/src/backends/native/meta-crtc-kms.c
+@@ -253,7 +253,10 @@ is_plane_assigned (MetaKmsPlane     *plane,
+             return TRUE;
+           break;
+         case META_KMS_PLANE_TYPE_OVERLAY:
+-          g_assert_not_reached ();
++          /* there is an apple quirk where we use an overlay plane for our cursor */
++          if (kms_assignment->cursor_plane == plane)
++            return TRUE;
++          break;
+         }
+     }
+ 
+@@ -264,16 +267,20 @@ static MetaKmsPlane *
+ crtc_assigned_plane (MetaCrtcKms      *crtc_kms,
+                      MetaKmsPlaneType  kms_plane_type)
+ {
+-  switch (kms_plane_type)
++  int i;
++  MetaKmsPlane*planes[2] = {
++    crtc_kms->assigned_primary_plane,
++    crtc_kms->assigned_cursor_plane,
++  };
++
++  for (i = 0; i < G_N_ELEMENTS (planes); i++)
+     {
+-    case META_KMS_PLANE_TYPE_PRIMARY:
+-      return crtc_kms->assigned_primary_plane;
+-    case META_KMS_PLANE_TYPE_CURSOR:
+-      return crtc_kms->assigned_cursor_plane;
+-    case META_KMS_PLANE_TYPE_OVERLAY:
+-    default:
+-      g_assert_not_reached ();
++      MetaKmsPlane *plane = planes[i];
++      if (plane && meta_kms_plane_get_plane_type (plane) == kms_plane_type)
++        return plane;
+     }
++
++  return NULL;
+ }
+ 
+ static gboolean
+@@ -357,6 +364,8 @@ meta_crtc_kms_assign_extra (MetaCrtc            *crtc,
+                             GError             **error)
+ {
+   MetaCrtcKms *crtc_kms = META_CRTC_KMS (crtc);
++  MetaKmsCrtc *kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
++  MetaKmsDevice *kms_device = meta_kms_crtc_get_device (kms_crtc);
+   MetaKmsPlane *primary_plane;
+   MetaKmsPlane *cursor_plane;
+   CrtcKmsAssignment *kms_assignment;
+@@ -365,9 +374,6 @@ meta_crtc_kms_assign_extra (MetaCrtc            *crtc,
+                                          crtc_assignments);
+   if (!primary_plane)
+     {
+-      MetaKmsCrtc *kms_crtc = meta_crtc_kms_get_kms_crtc (crtc_kms);
+-      MetaKmsDevice *kms_device = meta_kms_crtc_get_device (kms_crtc);
+-
+       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "No available primary plane found for CRTC %u (%s)",
+                    meta_kms_crtc_get_id (kms_crtc),
+@@ -378,6 +384,14 @@ meta_crtc_kms_assign_extra (MetaCrtc            *crtc,
+   cursor_plane = find_unassigned_plane (crtc_kms, META_KMS_PLANE_TYPE_CURSOR,
+                                         crtc_assignments);
+ 
++  if (!cursor_plane && meta_kms_device_get_flags (kms_device)
++      & META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
++    {
++      g_info ("No cursor plane found, but we can try an overlay plane for the cursor");
++      cursor_plane = find_unassigned_plane (crtc_kms, META_KMS_PLANE_TYPE_OVERLAY,
++                                            crtc_assignments);
++    }
++
+   kms_assignment = g_new0 (CrtcKmsAssignment, 1);
+   kms_assignment->primary_plane = primary_plane;
+   kms_assignment->cursor_plane = cursor_plane;
+diff --git a/src/backends/native/meta-cursor-renderer-native.c b/src/backends/native/meta-cursor-renderer-native.c
+index 20218b04ad..62d8afcb1c 100644
+--- a/src/backends/native/meta-cursor-renderer-native.c
++++ b/src/backends/native/meta-cursor-renderer-native.c
+@@ -53,6 +53,7 @@
+ #include "common/meta-cogl-drm-formats.h"
+ #include "common/meta-drm-format-helpers.h"
+ #include "core/boxes-private.h"
++#include "glib.h"
+ #include "meta/boxes.h"
+ #include "meta/meta-backend.h"
+ #include "meta/util.h"
+@@ -99,6 +100,8 @@ typedef struct _MetaCursorRendererNativeGpuData
+   CoglPixelFormat cogl_format;
+   uint64_t cursor_width;
+   uint64_t cursor_height;
++  gboolean use_overlay;
++  uint32_t overlay_padding;
+ } MetaCursorRendererNativeGpuData;
+ 
+ typedef struct _KmsCursorData
+@@ -675,6 +678,14 @@ get_optimal_cursor_size (MetaCrtcKms *crtc_kms,
+   if (!kms_plane)
+     return FALSE;
+ 
++  if (cursor_renderer_gpu_data->use_overlay)
++    {
++      // TODO check min size
++      *out_cursor_width = required_width;
++      *out_cursor_height = required_height;
++      return TRUE;
++    }
++
+   size_hints = meta_kms_plane_get_cursor_size_hints (kms_plane);
+ 
+   for (i = 0; i < size_hints->num_of_size_hints; i++)
+@@ -827,6 +838,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+                                        CoglPixelFormat           dst_format,
+                                        int                       dst_width,
+                                        int                       dst_height,
++                                       int                       cursor_x,
++                                       int                       cursor_y,
++                                       int                       cursor_width,
++                                       int                       cursor_height,
+                                        GError                  **error)
+ {
+   MetaCursorRendererNativePrivate *priv =
+@@ -839,6 +854,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+   g_autoptr (CoglOffscreen) offscreen = NULL;
+   g_autoptr (CoglPipeline) pipeline = NULL;
+   ClutterColorState *color_state;
++  float dst_x0, dst_y0, dst_x1, dst_y1;
+ 
+   src_texture = cogl_texture_2d_new_from_data (cogl_context,
+                                                width, height,
+@@ -849,7 +865,7 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+   if (!src_texture)
+     return NULL;
+ 
+-  if (dst_width < 1 || dst_height < 1)
++  if (dst_width < 32 || dst_height < 32)
+     {
+       g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "Invalid size for cursor texture %d x %d",
+@@ -857,6 +873,12 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+       return NULL;
+     }
+ 
++  /* Calcualte target coordinates for cursor */
++  dst_x0 = 2 * cursor_x / (float)(dst_width) - 1;
++  dst_y0 = 2 * cursor_y / (float)(dst_height) - 1;
++  dst_x1 = 2 * (cursor_x + cursor_width) / (float)(dst_width) - 1;
++  dst_y1 = 2 * (cursor_y + cursor_height) / (float)(dst_height) - 1;
++
+   dst_texture = cogl_texture_2d_new_with_format (cogl_context,
+                                                  dst_width,
+                                                  dst_height,
+@@ -886,10 +908,10 @@ scale_and_transform_cursor_sprite_cpu (MetaCursorRendererNative *cursor_renderer
+                             0.0f, 0.0f, 0.0f, 0.0f);
+   cogl_framebuffer_draw_textured_rectangle (COGL_FRAMEBUFFER (offscreen),
+                                             pipeline,
+-                                            -1.0f, -1.0f,
+-                                            1.0f, 1.0f,
+-                                            0.0f, 1.0f,
+-                                            1.0f, 0.0f);
++                                            dst_x0, -dst_y0,
++                                            dst_x1, -dst_y1,
++                                            0.0f, 0.0,
++                                            1.0, 1.0f);
+ 
+   return COGL_TEXTURE (g_steal_pointer (&dst_texture));
+ }
+@@ -1015,11 +1037,33 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                          &hot_x, &hot_y);
+   hotspot = GRAPHENE_POINT_INIT (hot_x, hot_y);
+ 
+-  if (width != crtc_dst_width || height != crtc_dst_height ||
++  const int crtc_cursor_padding = cursor_renderer_gpu_data->overlay_padding;
++
++  if (crtc_cursor_padding > 0 || width != crtc_dst_width || height != crtc_dst_height ||
+       !graphene_matrix_is_identity (&matrix) ||
+       gbm_format != cursor_renderer_gpu_data->drm_format ||
+       clutter_color_state_needs_mapping (cursor_color_state, target_color_state))
+     {
++      int crtc_cursor_x, crtc_cursor_y;
++      int crtc_cursor_width;
++      int crtc_cursor_height;
++
++      /* shift the target rectangle into the middle of the extended rectangle */
++      crtc_cursor_x = crtc_cursor_padding;
++      crtc_cursor_y = crtc_cursor_padding;
++      crtc_cursor_width = crtc_dst_width;
++      crtc_cursor_height = crtc_dst_height;
++
++      /* also shift the hotspot */
++      hot_x += crtc_cursor_padding;
++      hot_y += crtc_cursor_padding;
++
++      /* add padding to the cursors surface */
++      crtc_dst_width += 2 * crtc_cursor_padding;
++      crtc_dst_height += 2 * crtc_cursor_padding;
++
++      hotspot = GRAPHENE_POINT_INIT (hot_x, hot_y);
++
+       const MetaFormatInfo *format_info;
+       g_autoptr (GError) error = NULL;
+       g_autoptr (CoglTexture) texture = NULL;
+@@ -1043,6 +1087,10 @@ load_scaled_and_transformed_cursor_sprite (MetaCursorRendererNative *native,
+                                                        cursor_renderer_gpu_data->cogl_format,
+                                                        crtc_dst_width,
+                                                        crtc_dst_height,
++                                                       crtc_cursor_x,
++                                                       crtc_cursor_y,
++                                                       crtc_cursor_width,
++                                                       crtc_cursor_height,
+                                                        &error);
+       if (!texture)
+         {
+@@ -1330,13 +1378,20 @@ cursor_planes_support_format (MetaKmsDevice  *kms_device,
+                               const uint32_t  format)
+ {
+   gboolean supported = FALSE;
++  gboolean use_overlays;
+   GList *l;
+ 
++  use_overlays = meta_kms_device_get_flags (kms_device) &
++                 META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY;
++
+   for (l = meta_kms_device_get_planes (kms_device); l; l = l->next)
+     {
+       MetaKmsPlane *plane = l->data;
++      MetaKmsPlaneType plane_type = meta_kms_plane_get_plane_type (plane);
++      gboolean is_cursor_plane = plane_type == META_KMS_PLANE_TYPE_CURSOR
++                                 || (use_overlays && plane_type == META_KMS_PLANE_TYPE_OVERLAY);
+ 
+-      if (meta_kms_plane_get_plane_type (plane) != META_KMS_PLANE_TYPE_CURSOR)
++      if (!is_cursor_plane)
+         continue;
+ 
+       if (!meta_kms_plane_is_format_supported (plane, format))
+@@ -1423,6 +1478,13 @@ init_hw_cursor_support_for_gpu (MetaGpuKms *gpu_kms)
+   cursor_renderer_gpu_data->drm_format = format_info->drm_format;
+   cursor_renderer_gpu_data->cogl_format = format_info->cogl_format;
+ 
++  if (meta_kms_device_get_flags (kms_device) &
++      META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
++    {
++      cursor_renderer_gpu_data->use_overlay = true;
++      cursor_renderer_gpu_data->overlay_padding = 32;
++    }
++
+   meta_topic (META_DEBUG_KMS,
+               "Using cursor plane format %s (0x%x) for %s, use_gbm=%d",
+               meta_drm_format_to_string (&tmp, format_info->drm_format),
+diff --git a/src/backends/native/meta-kms-cursor-manager.c b/src/backends/native/meta-kms-cursor-manager.c
+index caec41240c..97481eb5ba 100644
+--- a/src/backends/native/meta-kms-cursor-manager.c
++++ b/src/backends/native/meta-kms-cursor-manager.c
+@@ -15,6 +15,9 @@
+  * along with this program; if not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "backends/native/meta-kms-device.h"
++#include "backends/native/meta-kms-impl-device.h"
++#include "backends/native/meta-kms-types.h"
+ #include "config.h"
+ 
+ #include "backends/native/meta-kms-cursor-manager.h"
+@@ -265,6 +268,8 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+                        float                   y,
+                        graphene_rect_t        *out_cursor_rect)
+ {
++  MetaKmsCrtc *crtc = crtc_state_impl->crtc;
++  MetaKmsDevice *device = meta_kms_crtc_get_device (crtc);
+   int crtc_x, crtc_y, crtc_width, crtc_height;
+   int buffer_width, buffer_height;
+   graphene_rect_t cursor_rect;
+@@ -293,10 +298,18 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+       .height = buffer_height,
+     },
+   };
+-  if (cursor_rect.origin.x + cursor_rect.size.width > 0.0 &&
+-      cursor_rect.origin.y + cursor_rect.size.height > 0.0 &&
+-      cursor_rect.origin.x < crtc_width &&
+-      cursor_rect.origin.y < crtc_height)
++
++  int padding = 0;
++  if (meta_kms_device_get_flags (device) & META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
++    {
++      /* TODO get padding from caps */
++      padding = 32;
++    }
++
++  if (cursor_rect.origin.x + cursor_rect.size.width - padding > 0.0 &&
++      cursor_rect.origin.y + cursor_rect.size.height - padding > 0.0 &&
++      cursor_rect.origin.x + padding < crtc_width &&
++      cursor_rect.origin.y + padding < crtc_height)
+     {
+       if (out_cursor_rect)
+         *out_cursor_rect = cursor_rect;
+diff --git a/src/backends/native/meta-kms-device.c b/src/backends/native/meta-kms-device.c
+index 4dec048d08..45490cb020 100644
+--- a/src/backends/native/meta-kms-device.c
++++ b/src/backends/native/meta-kms-device.c
+@@ -225,7 +225,14 @@ gboolean
+ meta_kms_device_has_cursor_plane_for (MetaKmsDevice*device,
+                                       MetaKmsCrtc  *crtc)
+ {
+-  return has_plane_with_type_for (device, crtc, META_KMS_PLANE_TYPE_CURSOR);
++  if (has_plane_with_type_for (device, crtc, META_KMS_PLANE_TYPE_CURSOR))
++    return TRUE;
++
++  if (meta_kms_device_get_flags (device) & META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY)
++    if (has_plane_with_type_for (device, crtc, META_KMS_PLANE_TYPE_OVERLAY))
++      return TRUE;
++
++  return FALSE;
+ }
+ 
+ GList *
+@@ -788,6 +795,9 @@ meta_kms_device_new (MetaKms            *kms,
+   if (device->caps.supports_color_modes)
+     device->flags |= META_KMS_DEVICE_FLAG_SUPPORTS_COLOR_MODES;
+ 
++  if (!g_strcmp0 ("apple", device->driver_name))
++    device->flags |= META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY;
++
+   return device;
+ }
+ 
+diff --git a/src/backends/native/meta-kms-types.h b/src/backends/native/meta-kms-types.h
+index 599b7e56f1..97411e8ae2 100644
+--- a/src/backends/native/meta-kms-types.h
++++ b/src/backends/native/meta-kms-types.h
+@@ -64,6 +64,7 @@ typedef enum _MetaKmsDeviceFlag
+   META_KMS_DEVICE_FLAG_FORCE_LEGACY = 1 << 6,
+   META_KMS_DEVICE_FLAG_DISABLE_CLIENT_MODIFIERS = 1 << 7,
+   META_KMS_DEVICE_FLAG_SUPPORTS_COLOR_MODES = 1 << 8,
++  META_KMS_DEVICE_FLAG_PADDED_CURSOR_ON_OVERLAY = 1 << 9,
+ } MetaKmsDeviceFlag;
+ 
+ typedef enum _MetaKmsResourceChanges
+-- 
+2.53.0
+
