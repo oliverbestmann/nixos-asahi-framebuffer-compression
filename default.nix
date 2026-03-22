@@ -25,21 +25,28 @@
       );
 
       mutter = prev.mutter.overrideAttrs (
-        _: mp: (
+        _: mp:
+        (
           let
             patches = {
               "49.4" = [
-                  ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-49.4.patch
-                  ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-49.4.patch
-                  ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-49.4.patch
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-49.4.patch
+                ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-49.4.patch
+                ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-49.4.patch
+              ];
+              "49.5" = [
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-49.5.patch
+                ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-49.5.patch
+                ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-49.5.patch
               ];
               "50.0" = [
-                  ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.0.patch
-                  ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-50.0.patch
-                  ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-50.0.patch
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.0.patch
+                ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-50.0.patch
+                ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-50.0.patch
               ];
             };
-          in {
+          in
+          {
             patches = (mp.patches or [ ]) ++ patches."${mp.version}";
           }
         )
