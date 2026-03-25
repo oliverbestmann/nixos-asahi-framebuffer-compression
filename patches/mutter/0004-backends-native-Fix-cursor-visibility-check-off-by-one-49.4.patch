@@ -1,0 +1,27 @@
+From d3332dbbd7f7f8236b7cf985dc14a9788f7cfe91 Mon Sep 17 00:00:00 2001
+From: Oliver Bestmann <oliver.bestmann@googlemail.com>
+Date: Wed, 25 Mar 2026 21:55:26 +0100
+Subject: [PATCH 4/4] backends/native: Fix cursor visibility check off-by-one.
+
+---
+ src/backends/native/meta-kms-cursor-manager.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/backends/native/meta-kms-cursor-manager.c b/src/backends/native/meta-kms-cursor-manager.c
+index 658a4c8c30..282bd9e847 100644
+--- a/src/backends/native/meta-kms-cursor-manager.c
++++ b/src/backends/native/meta-kms-cursor-manager.c
+@@ -300,8 +300,8 @@ calculate_cursor_rect (CrtcStateImpl          *crtc_state_impl,
+ 
+   cursor_padding = crtc_state_impl->cursor_padding;
+ 
+-  if (cursor_rect.origin.x + cursor_rect.size.width - cursor_padding > 0.0 &&
+-      cursor_rect.origin.y + cursor_rect.size.height - cursor_padding > 0.0 &&
++  if (cursor_rect.origin.x + cursor_rect.size.width - cursor_padding >= 0.0 &&
++      cursor_rect.origin.y + cursor_rect.size.height - cursor_padding >= 0.0 &&
+       cursor_rect.origin.x + cursor_padding < crtc_width &&
+       cursor_rect.origin.y + cursor_padding < crtc_height)
+     {
+-- 
+2.53.0
+
