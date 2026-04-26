@@ -1,4 +1,4 @@
-From cf99338c3925784800013fe231a2850abc884603 Mon Sep 17 00:00:00 2001
+From 4fd7ccb95680b1e5be0f9c3dfea7908de51af253 Mon Sep 17 00:00:00 2001
 From: Oliver Bestmann <oliver.bestmann@googlemail.com>
 Date: Tue, 10 Mar 2026 14:23:50 +0100
 Subject: [PATCH 2/2] fixup!: do not check pitch with INTERCHANGE modifier
@@ -9,10 +9,10 @@ Signed-off-by: Oliver Bestmann <oliver.bestmann@googlemail.com>
  1 file changed, 8 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/gpu/drm/apple/plane.c b/drivers/gpu/drm/apple/plane.c
-index 198ddb93b7d0..5414ea730af0 100644
+index 0695f6e600be..acc60a72f31c 100644
 --- a/drivers/gpu/drm/apple/plane.c
 +++ b/drivers/gpu/drm/apple/plane.c
-@@ -131,12 +131,14 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
+@@ -130,12 +130,14 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
  		return -EINVAL;
  	}
  
