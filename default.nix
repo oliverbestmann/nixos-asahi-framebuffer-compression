@@ -48,10 +48,10 @@
                 ./patches/mutter/0004-backends-native-Fix-cursor-visibility-check-off-by-one-50.0.patch
               ];
               "50.1" = [
-                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.0.patch
-                ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-50.0.patch
-                ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-50.0.patch
-                ./patches/mutter/0004-backends-native-Fix-cursor-visibility-check-off-by-one-50.0.patch
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.1.patch
+                ./patches/mutter/0002-backend-native-Use-less-padding-on-a-single-monitor-50.1.patch
+                ./patches/mutter/0003-backends-native-Pass-cursor-padding-to-cursor-manage-50.1.patch
+                ./patches/mutter/0004-backends-native-Fix-cursor-visibility-check-off-by-one-50.1.patch
               ];
             };
           in
