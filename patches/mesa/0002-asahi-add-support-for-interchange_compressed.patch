@@ -1,7 +1,7 @@
-From 75cecf1cd372197b0eb326c1bac5db72ff31983e Mon Sep 17 00:00:00 2001
+From 9317d56f2a18a1d0b3f7b915aca3fed68a3723aa Mon Sep 17 00:00:00 2001
 From: Oliver Bestmann <oliver.bestmann@googlemail.com>
 Date: Thu, 5 Feb 2026 18:55:02 +0100
-Subject: [PATCH 2/4] asahi: add support for interchange_compressed
+Subject: [PATCH 2/3] asahi: add support for interchange_compressed
 
 Apple hardware also supports the compressed "interchange" tile format.
 
@@ -17,17 +17,17 @@ As a result, only textures with depth 1 are supported (no array textures).
 ---
  src/asahi/genxml/cmdbuf.xml           |  3 ++
  src/asahi/layout/layout.c             | 41 ++++++++++++++++++++++++
- src/asahi/layout/layout.h             |  8 +++++
+ src/asahi/layout/layout.h             | 24 +++++++++++---
  src/asahi/lib/agx_helpers.h           |  2 ++
  src/gallium/drivers/asahi/agx_pipe.c  | 45 ++++++++++++++++++++++++---
  src/gallium/drivers/asahi/agx_state.c |  6 ++++
- 6 files changed, 101 insertions(+), 4 deletions(-)
+ 6 files changed, 113 insertions(+), 8 deletions(-)
 
 diff --git a/src/asahi/genxml/cmdbuf.xml b/src/asahi/genxml/cmdbuf.xml
-index 24164f50a42..6f33fc3301e 100644
+index c2979f9d58f..94e6012e5cb 100644
 --- a/src/asahi/genxml/cmdbuf.xml
 +++ b/src/asahi/genxml/cmdbuf.xml
-@@ -241,6 +241,7 @@
+@@ -246,6 +246,7 @@
      array texture (with a layered framebuffer) -->
      <field name="Levels" size="4" start="104" type="uint" modifier="minus(1)"/>
      <field name="Layers" size="14" start="108" type="uint" modifier="minus(1)"/>
@@ -35,7 +35,7 @@ index 24164f50a42..6f33fc3301e 100644
      <field name="Page-aligned layers" size="1" start="124" type="bool"/>
  
      <!-- Should writes to this image convert to sRGB?
-@@ -303,6 +304,8 @@
+@@ -308,6 +309,8 @@
      <!-- Note that 3D/arrays cannot be linear. -->
      <field name="Depth" size="14" start="110" type="uint" modifier="minus(1)"/>
      <field name="Page-aligned layers" size="1" start="126" type="bool"/>
@@ -104,7 +104,7 @@ index 4ff45296afe..d6543afcc88 100644
        UNREACHABLE("Unsupported tiling");
     }
 diff --git a/src/asahi/layout/layout.h b/src/asahi/layout/layout.h
-index de70df85f25..ab91708748a 100644
+index de70df85f25..74a6f67ce65 100644
 --- a/src/asahi/layout/layout.h
 +++ b/src/asahi/layout/layout.h
 @@ -45,6 +45,11 @@ enum ail_tiling {
@@ -119,7 +119,38 @@ index de70df85f25..ab91708748a 100644
  };
  
  /*
-@@ -575,6 +580,8 @@ ail_drm_modifier_to_tiling(uint64_t modifier)
+@@ -195,18 +200,26 @@ ail_get_linear_stride_B(const struct ail_layout *layout, ASSERTED uint8_t level)
+  * hardware, only strided linear images have an associated stride, there is no
+  * natural stride associated with nonlinear images. However, various clients
+  * assert that the stride is valid for the image if it were linear (even if it
+- * is in fact not linear). In those cases, by convention we use the minimum
+- * valid such stride.
++ * is in fact not linear). In those cases, by convention we use a stride
++ * greather than or equal to the minimum valid stride.
+  */
+ static inline uint32_t
+ ail_get_wsi_stride_B(const struct ail_layout *layout, unsigned level)
+ {
+    assert(level == 0 && "Mipmaps cannot be shared as WSI");
+ 
+-   if (layout->tiling == AIL_TILING_LINEAR)
++   switch (layout->tiling) {
++   case AIL_TILING_LINEAR:
+       return ail_get_linear_stride_B(layout, level);
+-   else
++
++   case AIL_TILING_INTERCHANGE: {
++      uint32_t stride = util_format_get_stride(layout->format, layout->width_px);
++      return ALIGN_POT(stride, 64);
++   }
++
++   default:
+       return util_format_get_stride(layout->format, layout->width_px);
++   }
+ }
+ 
+ static inline uint32_t
+@@ -575,6 +588,8 @@ ail_drm_modifier_to_tiling(uint64_t modifier)
     case DRM_FORMAT_MOD_APPLE_GPU_TILED:
     case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
        return AIL_TILING_GPU;
@@ -128,7 +159,7 @@ index de70df85f25..ab91708748a 100644
     default:
        UNREACHABLE("Unsupported modifier");
     }
-@@ -588,6 +595,7 @@ ail_is_drm_modifier_compressed(uint64_t modifier)
+@@ -588,6 +603,7 @@ ail_is_drm_modifier_compressed(uint64_t modifier)
     case DRM_FORMAT_MOD_APPLE_GPU_TILED:
        return false;
     case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
@@ -150,10 +181,10 @@ index bf7dfb9a6da..a2c5b9fca49 100644
  
     UNREACHABLE("Invalid tiling");
 diff --git a/src/gallium/drivers/asahi/agx_pipe.c b/src/gallium/drivers/asahi/agx_pipe.c
-index ddafd23a5a2..2cf742e20e0 100644
+index 61cb3d9e53b..df9ebae7f82 100644
 --- a/src/gallium/drivers/asahi/agx_pipe.c
 +++ b/src/gallium/drivers/asahi/agx_pipe.c
-@@ -56,6 +56,7 @@
+@@ -57,6 +57,7 @@
  
  uint64_t agx_best_modifiers[] = {
     DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
@@ -161,7 +192,7 @@ index ddafd23a5a2..2cf742e20e0 100644
     DRM_FORMAT_MOD_APPLE_GPU_TILED,
     DRM_FORMAT_MOD_LINEAR,
  };
-@@ -83,6 +84,7 @@ void agx_init_state_functions(struct pipe_context *ctx);
+@@ -84,6 +85,7 @@ void agx_init_state_functions(struct pipe_context *ctx);
  const static char *s_tiling[] = {
     [AIL_TILING_LINEAR] = "LINR",
     [AIL_TILING_GPU] = "GPU",
@@ -169,7 +200,7 @@ index ddafd23a5a2..2cf742e20e0 100644
  };
  
  #define rsrc_debug(res, ...)                                                   \
-@@ -427,14 +429,49 @@ agx_compression_allowed(const struct agx_resource *pres)
+@@ -428,14 +430,49 @@ agx_compression_allowed(const struct agx_resource *pres)
     return true;
  }
  
@@ -224,7 +255,7 @@ index ddafd23a5a2..2cf742e20e0 100644
     if (agx_twiddled_allowed(pres) &&
         drm_find_modifier(DRM_FORMAT_MOD_APPLE_GPU_TILED, modifiers, count))
 diff --git a/src/gallium/drivers/asahi/agx_state.c b/src/gallium/drivers/asahi/agx_state.c
-index 1488d487bc2..af63191fcf8 100644
+index c2784427e38..a1231e42388 100644
 --- a/src/gallium/drivers/asahi/agx_state.c
 +++ b/src/gallium/drivers/asahi/agx_state.c
 @@ -737,6 +737,9 @@ agx_pack_texture(void *out, struct agx_resource *rsrc,
@@ -248,5 +279,5 @@ index 1488d487bc2..af63191fcf8 100644
              assert((tex->layout.tiling != AIL_TILING_LINEAR) || (layers == 1));
              cfg.layers = layers;
 -- 
-2.53.0
+2.54.0
 

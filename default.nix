@@ -5,10 +5,6 @@
       name = "apple: enable interchange compression modifier";
       patch = ./patches/linux/0001-drm-apple-support-interchange-compression.patch;
     }
-    {
-      name = "apple: fixup: do not check pitch for alignment";
-      patch = ./patches/linux/0002-fixup-do-not-check-pitch-with-INTERCHANGE-modifier.patch;
-    }
   ];
 
   nixpkgs.overlays = [
@@ -19,7 +15,6 @@
             ./patches/mesa/0001-asahi-add-INTERCHANGE_COMPRESSED-modifier-for-testin.patch
             ./patches/mesa/0002-asahi-add-support-for-interchange_compressed.patch
             ./patches/mesa/0003-hk-add-support-for-interchange_compressed.patch
-            ./patches/mesa/0004-fixup-agx-adjust-stride-for-interchange.patch
           ];
         }
       );
@@ -60,7 +55,7 @@
                 ./patches/mutter/0004-backends-native-Fix-cursor-visibility-check-off-by-one-50.2.patch
               ];
               "50.3" = [
-                # i've collapsed it to a single patch
+                # i've collapsed the patches into a single patch
                 ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.3.patch
               ];
             };

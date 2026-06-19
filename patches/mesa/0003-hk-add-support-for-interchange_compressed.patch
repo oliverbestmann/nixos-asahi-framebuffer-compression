@@ -1,7 +1,7 @@
-From a49dfb8843b3ff7b0163d1ecfb0bc393d3c24c83 Mon Sep 17 00:00:00 2001
+From 528ef17ca0e26981b2b6e603bbaf2a501c009a22 Mon Sep 17 00:00:00 2001
 From: Oliver Bestmann <oliver.bestmann@googlemail.com>
 Date: Sun, 8 Feb 2026 12:53:06 +0100
-Subject: [PATCH 3/4] hk: add support for interchange_compressed
+Subject: [PATCH 3/3] hk: add support for interchange_compressed
 
 ---
  src/asahi/vulkan/hk_format.c     | 24 +++++++++++++++++++++++-
@@ -112,5 +112,5 @@ index 27e13e73832..cd7a561ca9a 100644
              assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
              cfg.layers = layers;
 -- 
-2.53.0
+2.54.0
 
