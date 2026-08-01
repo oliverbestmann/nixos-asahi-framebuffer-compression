@@ -1,0 +1,1542 @@
+From 2ceeaf004ee391e72373b6f96aec3bb30a3dfb84 Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:49:17 +0200
+Subject: [PATCH 1/8] kms/crtc: Mark CTM supported when the property exists
+
+ctm.supported was only set after successfully reading a non-zero CTM
+blob, so hardware that exposes the CTM property but leaves it unset
+(blob id 0) was treated as not supporting CTM at all. Apple Silicon
+under the apple-dcp driver boots in exactly that state.
+
+Set ctm.supported as soon as the property is present, and only read the
+matrix when there is a blob to read. Restrict this to atomic devices,
+since the simple backend has no code path that programs CTM.
+
+Also log gamma LUT and CTM capability when reading CRTC state, which is
+what one wants to see when a display does not tint.
+---
+ src/backends/native/meta-kms-crtc.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/src/backends/native/meta-kms-crtc.c b/src/backends/native/meta-kms-crtc.c
+index 95ce7bbf132..29799a8d634 100644
+--- a/src/backends/native/meta-kms-crtc.c
++++ b/src/backends/native/meta-kms-crtc.c
+@@ -303,6 +303,15 @@ read_crtc_ctm (MetaKmsCrtc       *crtc,
+   if (!prop_ctm->prop_id)
+     return;
+ 
++  /* CTM is only applied via the atomic color-update path, so do not advertise
++   * support on simple backends, where programming it would be a no-op. */
++  if (!META_IS_KMS_IMPL_DEVICE_ATOMIC (impl_device))
++    return;
++
++  /* The property existing means CTM is supported, even when it is currently
++   * unset (blob id 0). */
++  crtc_state->ctm.supported = TRUE;
++
+   blob_id = prop_ctm->value;
+   if (blob_id == 0)
+     return;
+@@ -320,8 +329,6 @@ read_crtc_ctm (MetaKmsCrtc       *crtc,
+ 
+   drm_ctm = blob->data;
+ 
+-  /* Allocate internal structure for CTM */
+-  crtc_state->ctm.supported = TRUE;
+   crtc_state->ctm.value = meta_ctm_new ();
+ 
+   /* Copy the 3x3 matrix from KMS blob */
+@@ -443,11 +450,15 @@ meta_kms_crtc_read_state (MetaKmsCrtc             *crtc,
+   crtc->current_state = crtc_state;
+ 
+   meta_topic (META_DEBUG_KMS,
+-              "Read CRTC %u state: active: %d, mode: %s, changed: %s",
++              "Read CRTC %u state: active: %d, mode: %s, "
++              "gamma_lut: %s (size %d), ctm: %s, changed: %s",
+               crtc->id, crtc->current_state.is_active,
+               crtc->current_state.is_drm_mode_valid
+                 ? crtc->current_state.drm_mode.name
+                 : "(nil)",
++              crtc->current_state.gamma.supported ? "yes" : "no",
++              crtc->current_state.gamma.size,
++              crtc->current_state.ctm.supported ? "yes" : "no",
+               changes == META_KMS_RESOURCE_CHANGE_NONE
+                 ? "no"
+                 : "yes");
+-- 
+GitLab
+
+
+From 833ca21574a3ab853152f1e69180569e6330c7cf Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:49:28 +0200
+Subject: [PATCH 2/8] kms/atomic: Allow clearing CTM with a NULL matrix
+
+meta_kms_update_set_crtc_ctm() accepts a NULL MetaCtm and stores it as
+such, but process_crtc_color_updates() dereferenced it unconditionally.
+Nothing passed NULL so far, so this never crashed, but there was no way
+to return a CRTC to its default color transformation either.
+
+Handle NULL like an empty gamma LUT does: set the CTM property to blob
+id 0, which makes the driver bypass the matrix.
+---
+ .../native/meta-kms-impl-device-atomic.c      | 37 ++++++++++++-------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
+
+diff --git a/src/backends/native/meta-kms-impl-device-atomic.c b/src/backends/native/meta-kms-impl-device-atomic.c
+index c020c007e4c..8c8da8318a1 100644
+--- a/src/backends/native/meta-kms-impl-device-atomic.c
++++ b/src/backends/native/meta-kms-impl-device-atomic.c
+@@ -898,23 +898,34 @@ process_crtc_color_updates (MetaKmsImplDevice  *impl_device,
+   if (color_update->ctm.has_update)
+     {
+       MetaCtm *ctm = color_update->ctm.state;
+-      struct drm_color_ctm drm_color_ctm;
+       uint32_t ctm_blob_id = 0;
+-      int i;
+ 
+-      for (i = 0; i < 9; i++)
+-        drm_color_ctm.matrix[i] = ctm->matrix[i];
++      if (ctm)
++        {
++          struct drm_color_ctm drm_color_ctm;
++          int i;
+ 
+-      ctm_blob_id = store_new_blob (impl_device, blob_ids,
+-                                    &drm_color_ctm, sizeof drm_color_ctm,
+-                                    error);
+-      if (!ctm_blob_id)
+-        return FALSE;
++          for (i = 0; i < 9; i++)
++            drm_color_ctm.matrix[i] = ctm->matrix[i];
+ 
+-      meta_topic (META_DEBUG_KMS,
+-                  "[atomic] Setting CRTC (%u, %s) ctm",
+-                  meta_kms_crtc_get_id (crtc),
+-                  meta_kms_impl_device_get_path (impl_device));
++          ctm_blob_id = store_new_blob (impl_device, blob_ids,
++                                        &drm_color_ctm, sizeof drm_color_ctm,
++                                        error);
++          if (!ctm_blob_id)
++            return FALSE;
++
++          meta_topic (META_DEBUG_KMS,
++                      "[atomic] Setting CRTC (%u, %s) ctm",
++                      meta_kms_crtc_get_id (crtc),
++                      meta_kms_impl_device_get_path (impl_device));
++        }
++      else
++        {
++          meta_topic (META_DEBUG_KMS,
++                      "[atomic] Setting CRTC (%u, %s) ctm to bypass",
++                      meta_kms_crtc_get_id (crtc),
++                      meta_kms_impl_device_get_path (impl_device));
++        }
+ 
+       if (!add_crtc_property (impl_device, crtc, req,
+                               META_KMS_CRTC_PROP_CTM,
+-- 
+GitLab
+
+
+From d8477c305c7115fd80836f49ffad680472fc5d25 Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:50:02 +0200
+Subject: [PATCH 3/8] color: Add temperature RGB scales and MetaCtm helpers
+
+Night Light derives its tint from colord blackbody RGB factors, but
+those factors are only reachable while generating a gamma LUT. Expose
+them as meta_color_get_temperature_rgb_scales() so a color transformation
+matrix can be built from the exact same math, and add
+meta_ctm_new_from_rgb_scales() to turn them into a diagonal matrix in the
+S31.32 fixed-point format the CTM property expects. Scales are clamped to
+[0, 1] and non-finite values are rejected, so no invalid matrix can reach
+the kernel.
+
+Also add optional is_ctm_supported() and set_ctm() vfuncs on MetaCrtc.
+They default to "unsupported" and a no-op, so CRTCs that cannot do this,
+such as virtual and test ones, need no changes.
+---
+ src/backends/meta-color-profile.c | 17 +++++++++++
+ src/backends/meta-color-profile.h |  8 +++++
+ src/backends/meta-crtc.c          | 49 +++++++++++++++++++++++++++++++
+ src/backends/meta-crtc.h          | 20 +++++++++++++
+ 4 files changed, 94 insertions(+)
+
+diff --git a/src/backends/meta-color-profile.c b/src/backends/meta-color-profile.c
+index 4a7d995a310..08505392a29 100644
+--- a/src/backends/meta-color-profile.c
++++ b/src/backends/meta-color-profile.c
+@@ -498,6 +498,23 @@ meta_color_profile_generate_gamma_lut (MetaColorProfile *color_profile,
+     }
+ }
+ 
++void
++meta_color_get_temperature_rgb_scales (unsigned int  temperature,
++                                       float        *out_red,
++                                       float        *out_green,
++                                       float        *out_blue)
++{
++  CdColorRGB blackbody_color;
++
++  g_return_if_fail (out_red && out_green && out_blue);
++
++  set_blackbody_color_for_temperature (&blackbody_color, temperature);
++
++  *out_red = (float) blackbody_color.R;
++  *out_green = (float) blackbody_color.G;
++  *out_blue = (float) blackbody_color.B;
++}
++
+ const MetaColorCalibration *
+ meta_color_profile_get_calibration (MetaColorProfile *color_profile)
+ {
+diff --git a/src/backends/meta-color-profile.h b/src/backends/meta-color-profile.h
+index 50a59edda74..229920bf080 100644
+--- a/src/backends/meta-color-profile.h
++++ b/src/backends/meta-color-profile.h
+@@ -70,6 +70,14 @@ MetaGammaLut * meta_color_profile_generate_gamma_lut (MetaColorProfile *color_pr
+                                                       unsigned int      temperature,
+                                                       size_t            lut_size);
+ 
++/* Blackbody RGB scale factors for a color temperature; this is the same math
++ * the uncalibrated gamma LUT is generated from. */
++META_EXPORT_TEST
++void meta_color_get_temperature_rgb_scales (unsigned int  temperature,
++                                            float        *out_red,
++                                            float        *out_green,
++                                            float        *out_blue);
++
+ META_EXPORT_TEST
+ const MetaColorCalibration * meta_color_profile_get_calibration (MetaColorProfile *color_profile);
+ 
+diff --git a/src/backends/meta-crtc.c b/src/backends/meta-crtc.c
+index a3dc00a4671..271c1670bc0 100644
+--- a/src/backends/meta-crtc.c
++++ b/src/backends/meta-crtc.c
+@@ -19,6 +19,8 @@
+ 
+ #include "backends/meta-crtc.h"
+ 
++#include <math.h>
++
+ #include "backends/meta-gpu.h"
+ #include "meta/meta-backend.h"
+ 
+@@ -180,6 +182,27 @@ meta_crtc_set_gamma_lut (MetaCrtc           *crtc,
+   return META_CRTC_GET_CLASS (crtc)->set_gamma_lut (crtc, lut);
+ }
+ 
++gboolean
++meta_crtc_is_ctm_supported (MetaCrtc *crtc)
++{
++  MetaCrtcClass *klass = META_CRTC_GET_CLASS (crtc);
++
++  if (klass->is_ctm_supported)
++    return klass->is_ctm_supported (crtc);
++
++  return FALSE;
++}
++
++void
++meta_crtc_set_ctm (MetaCrtc      *crtc,
++                   const MetaCtm *ctm)
++{
++  MetaCrtcClass *klass = META_CRTC_GET_CLASS (crtc);
++
++  if (klass->set_ctm)
++    klass->set_ctm (crtc, ctm);
++}
++
+ void
+ meta_gamma_lut_free (MetaGammaLut *lut)
+ {
+@@ -366,6 +389,32 @@ meta_ctm_new (void)
+   return ctm;
+ }
+ 
++static uint64_t
++scale_to_s31_32 (float scale)
++{
++  if (!isfinite (scale) || scale < 0.0f)
++    scale = 0.0f;
++  else if (scale > 1.0f)
++    scale = 1.0f;
++
++  return (uint64_t) (scale * (double) ((uint64_t) 1 << 32));
++}
++
++MetaCtm *
++meta_ctm_new_from_rgb_scales (float red,
++                              float green,
++                              float blue)
++{
++  MetaCtm *ctm = g_new0 (MetaCtm, 1);
++
++  /* Diagonal 3x3 matrix in S31.32 fixed-point, row-major */
++  ctm->matrix[0] = scale_to_s31_32 (red);
++  ctm->matrix[4] = scale_to_s31_32 (green);
++  ctm->matrix[8] = scale_to_s31_32 (blue);
++
++  return ctm;
++}
++
+ MetaCtm *
+ meta_ctm_copy (const MetaCtm *src_ctm)
+ {
+diff --git a/src/backends/meta-crtc.h b/src/backends/meta-crtc.h
+index 3e6bfee66d1..ffb8bbba302 100644
+--- a/src/backends/meta-crtc.h
++++ b/src/backends/meta-crtc.h
+@@ -47,6 +47,11 @@ struct _MetaCrtcClass
+   void (* set_gamma_lut) (MetaCrtc           *crtc,
+                           const MetaGammaLut *lut);
+ 
++  gboolean (* is_ctm_supported) (MetaCrtc *crtc);
++
++  void (* set_ctm) (MetaCrtc      *crtc,
++                    const MetaCtm *ctm);
++
+   gboolean (* assign_extra) (MetaCrtc            *crtc,
+                              MetaCrtcAssignment  *crtc_assignment,
+                              GPtrArray           *crtc_assignments,
+@@ -105,6 +110,11 @@ MetaGammaLut * meta_crtc_get_gamma_lut (MetaCrtc *crtc);
+ void meta_crtc_set_gamma_lut (MetaCrtc           *crtc,
+                               const MetaGammaLut *lut);
+ 
++gboolean meta_crtc_is_ctm_supported (MetaCrtc *crtc);
++
++void meta_crtc_set_ctm (MetaCrtc      *crtc,
++                        const MetaCtm *ctm);
++
+ META_EXPORT_TEST
+ void meta_gamma_lut_free (MetaGammaLut *lut);
+ 
+@@ -131,10 +141,19 @@ META_EXPORT_TEST
+ gboolean meta_gamma_lut_equal (const MetaGammaLut *gamma,
+                                const MetaGammaLut *other_gamma);
+ 
++META_EXPORT_TEST
+ void meta_ctm_free (MetaCtm *ctm);
+ 
+ MetaCtm * meta_ctm_new (void);
+ 
++/* Diagonal matrix from RGB scale factors. Scales are clamped to [0, 1], and
++ * non-finite scales are treated as 0. */
++META_EXPORT_TEST
++MetaCtm * meta_ctm_new_from_rgb_scales (float red,
++                                        float green,
++                                        float blue);
++
++META_EXPORT_TEST
+ MetaCtm * meta_ctm_copy (const MetaCtm *ctm);
+ 
+ gboolean meta_ctm_equal (const MetaCtm *ctm,
+@@ -148,3 +167,4 @@ MetaCrtcConfig * meta_crtc_config_new (graphene_rect_t     *layout,
+ gboolean meta_crtc_is_leased (MetaCrtc *crtc);
+ 
+ G_DEFINE_AUTOPTR_CLEANUP_FUNC (MetaGammaLut, meta_gamma_lut_free)
++G_DEFINE_AUTOPTR_CLEANUP_FUNC (MetaCtm, meta_ctm_free)
+-- 
+GitLab
+
+
+From 5822f4b3734f95747fd72f790390d20767209375 Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:50:24 +0200
+Subject: [PATCH 4/8] crtc/kms: Wire CTM through the cache and onscreen path
+
+Mirror the gamma LUT flow for color transformation matrices, so a CTM
+survives the same events a gamma LUT does:
+
+- MetaMonitorManagerNative caches the matrix per CRTC
+- MetaCrtcKms updates that cache and emits "ctm-changed"
+- MetaOnscreenNative invalidates on that signal and on view rebuild, and
+  programs the matrix from meta_onscreen_native_prepare_frame()
+- MetaMonitor can set a CTM on the CRTCs of its current mode
+
+Following the gamma LUT here means resume, hotplug and view recreation
+reprogram the matrix through the existing invalidation path, and an empty
+cache programs blob id 0, which resets the CRTC to bypass.
+---
+ src/backends/meta-monitor-private.h           |  6 ++
+ src/backends/meta-monitor.c                   | 54 +++++++++++++
+ src/backends/native/meta-crtc-kms.c           | 77 +++++++++++++++++++
+ src/backends/native/meta-crtc-kms.h           |  2 +
+ .../native/meta-monitor-manager-native.c      | 42 ++++++++++
+ .../native/meta-monitor-manager-native.h      |  7 ++
+ src/backends/native/meta-onscreen-native.c    | 41 +++++++++-
+ 7 files changed, 228 insertions(+), 1 deletion(-)
+
+diff --git a/src/backends/meta-monitor-private.h b/src/backends/meta-monitor-private.h
+index e68bfc53099..694f31f7092 100644
+--- a/src/backends/meta-monitor-private.h
++++ b/src/backends/meta-monitor-private.h
+@@ -299,6 +299,12 @@ size_t meta_monitor_get_gamma_lut_size (MetaMonitor *monitor);
+ void meta_monitor_set_gamma_lut (MetaMonitor        *monitor,
+                                  const MetaGammaLut *lut);
+ 
++META_EXPORT_TEST
++gboolean meta_monitor_is_ctm_supported (MetaMonitor *monitor);
++
++void meta_monitor_set_ctm (MetaMonitor   *monitor,
++                           const MetaCtm *ctm);
++
+ MetaColorMode meta_monitor_get_color_mode (MetaMonitor *monitor);
+ 
+ META_EXPORT_TEST
+diff --git a/src/backends/meta-monitor.c b/src/backends/meta-monitor.c
+index 488ffeaa0fa..aa58e93be36 100644
+--- a/src/backends/meta-monitor.c
++++ b/src/backends/meta-monitor.c
+@@ -907,6 +907,60 @@ meta_monitor_set_gamma_lut (MetaMonitor        *monitor,
+                                   NULL);
+ }
+ 
++gboolean
++meta_monitor_is_ctm_supported (MetaMonitor *monitor)
++{
++  MetaOutput *output;
++  MetaCrtc *crtc;
++
++  output = meta_monitor_get_main_output (monitor);
++  crtc = meta_output_get_assigned_crtc (output);
++  if (!crtc)
++    return FALSE;
++
++  return meta_crtc_is_ctm_supported (crtc);
++}
++
++static gboolean
++set_ctm (MetaMonitor          *monitor,
++         MetaMonitorMode      *mode,
++         MetaMonitorCrtcMode  *monitor_crtc_mode,
++         gpointer              user_data,
++         GError              **error)
++{
++  const MetaCtm *ctm = user_data;
++  MetaCrtc *crtc;
++
++  crtc = meta_output_get_assigned_crtc (monitor_crtc_mode->output);
++
++  if (meta_crtc_is_ctm_supported (crtc))
++    meta_crtc_set_ctm (crtc, ctm);
++
++  return TRUE;
++}
++
++/**
++ * meta_monitor_set_ctm:
++ *
++ * Set a color transformation matrix on the monitor's CRTCs that support CTM.
++ * Used as a Night Light fallback when GAMMA_LUT is unavailable.
++ */
++void
++meta_monitor_set_ctm (MetaMonitor   *monitor,
++                      const MetaCtm *ctm)
++{
++  MetaMonitorMode *current_mode;
++
++  current_mode = meta_monitor_get_current_mode (monitor);
++  g_return_if_fail (current_mode);
++
++  meta_monitor_mode_foreach_crtc (monitor,
++                                  current_mode,
++                                  set_ctm,
++                                  (gpointer) ctm,
++                                  NULL);
++}
++
+ void
+ meta_monitor_create_backlight (MetaMonitor *monitor)
+ {
+diff --git a/src/backends/native/meta-crtc-kms.c b/src/backends/native/meta-crtc-kms.c
+index f65ca5607f9..e19885ea71c 100644
+--- a/src/backends/native/meta-crtc-kms.c
++++ b/src/backends/native/meta-crtc-kms.c
+@@ -37,6 +37,7 @@
+ enum
+ {
+   GAMMA_LUT_CHANGED,
++  CTM_CHANGED,
+ 
+   N_SIGNALS
+ };
+@@ -82,6 +83,18 @@ meta_crtc_kms_get_gamma_lut_size (MetaCrtc *crtc)
+   return crtc_state->gamma.size;
+ }
+ 
++static gboolean
++meta_crtc_kms_is_ctm_supported (MetaCrtc *crtc)
++{
++  MetaKmsCrtc *kms_crtc;
++  const MetaKmsCrtcState *crtc_state;
++
++  kms_crtc = meta_crtc_kms_get_kms_crtc (META_CRTC_KMS (crtc));
++  crtc_state = meta_kms_crtc_get_current_state (kms_crtc);
++
++  return crtc_state->ctm.supported;
++}
++
+ const MetaGammaLut *
+ meta_crtc_kms_peek_gamma_lut (MetaCrtcKms *crtc_kms)
+ {
+@@ -210,6 +223,60 @@ meta_crtc_kms_set_gamma_lut (MetaCrtc           *crtc,
+     clutter_stage_view_schedule_update (CLUTTER_STAGE_VIEW (renderer_view));
+ }
+ 
++const MetaCtm *
++meta_crtc_kms_peek_ctm (MetaCrtcKms *crtc_kms)
++{
++  MetaMonitorManagerNative *monitor_manager_native =
++    monitor_manager_from_crtc (META_CRTC (crtc_kms));
++
++  return meta_monitor_manager_native_get_cached_crtc_ctm (monitor_manager_native,
++                                                          crtc_kms);
++}
++
++static void
++meta_crtc_kms_set_ctm (MetaCrtc      *crtc,
++                       const MetaCtm *ctm)
++{
++  MetaCrtcKms *crtc_kms = META_CRTC_KMS (crtc);
++  MetaBackend *backend = meta_gpu_get_backend (meta_crtc_get_gpu (crtc));
++  MetaMonitorManagerNative *monitor_manager_native =
++    monitor_manager_from_crtc (crtc);
++  MetaRenderer *renderer = meta_backend_get_renderer (backend);
++  MetaRendererView *renderer_view;
++  MetaCtm *new_ctm = NULL;
++
++  if (ctm)
++    {
++      const double one = (double) ((uint64_t) 1 << 32);
++
++      meta_topic (META_DEBUG_COLOR,
++                  "Setting CRTC (%" G_GUINT64_FORMAT ") CTM diagonal to "
++                  "%.3f, %.3f, %.3f",
++                  meta_crtc_get_id (crtc),
++                  ctm->matrix[0] / one,
++                  ctm->matrix[4] / one,
++                  ctm->matrix[8] / one);
++
++      new_ctm = meta_ctm_copy (ctm);
++    }
++  else
++    {
++      meta_topic (META_DEBUG_COLOR,
++                  "Clearing CRTC (%" G_GUINT64_FORMAT ") CTM",
++                  meta_crtc_get_id (crtc));
++    }
++
++  meta_monitor_manager_native_update_cached_crtc_ctm (monitor_manager_native,
++                                                      crtc_kms,
++                                                      new_ctm);
++
++  g_signal_emit (crtc_kms, signals[CTM_CHANGED], 0);
++
++  renderer_view = meta_renderer_get_view_for_crtc (renderer, crtc);
++  if (renderer_view)
++    clutter_stage_view_schedule_update (CLUTTER_STAGE_VIEW (renderer_view));
++}
++
+ static gboolean
+ meta_crtc_kms_is_leased (MetaCrtc *crtc)
+ {
+@@ -572,6 +639,8 @@ meta_crtc_kms_class_init (MetaCrtcKmsClass *klass)
+   crtc_class->get_gamma_lut_size = meta_crtc_kms_get_gamma_lut_size;
+   crtc_class->get_gamma_lut = meta_crtc_kms_get_gamma_lut;
+   crtc_class->set_gamma_lut = meta_crtc_kms_set_gamma_lut;
++  crtc_class->is_ctm_supported = meta_crtc_kms_is_ctm_supported;
++  crtc_class->set_ctm = meta_crtc_kms_set_ctm;
+   crtc_class->assign_extra = meta_crtc_kms_assign_extra;
+   crtc_class->set_config = meta_crtc_kms_set_config;
+   crtc_class->unset_config = meta_crtc_kms_unset_config;
+@@ -589,6 +658,14 @@ meta_crtc_kms_class_init (MetaCrtcKmsClass *klass)
+                   NULL, NULL, NULL,
+                   G_TYPE_NONE, 0);
+ 
++  signals[CTM_CHANGED] =
++    g_signal_new ("ctm-changed",
++                  G_TYPE_FROM_CLASS (klass),
++                  G_SIGNAL_RUN_LAST,
++                  0,
++                  NULL, NULL, NULL,
++                  G_TYPE_NONE, 0);
++
+   kms_crtc_crtc_kms_quark =
+     g_quark_from_static_string ("meta-kms-crtc-crtc-kms-quark");
+ }
+diff --git a/src/backends/native/meta-crtc-kms.h b/src/backends/native/meta-crtc-kms.h
+index 38298253462..a2d2ebad311 100644
+--- a/src/backends/native/meta-crtc-kms.h
++++ b/src/backends/native/meta-crtc-kms.h
+@@ -53,6 +53,8 @@ MetaKmsCrtc * meta_crtc_kms_get_kms_crtc (MetaCrtcKms *crtc_kms);
+ 
+ const MetaGammaLut * meta_crtc_kms_peek_gamma_lut (MetaCrtcKms *crtc_kms);
+ 
++const MetaCtm * meta_crtc_kms_peek_ctm (MetaCrtcKms *crtc_kms);
++
+ MetaCrtcKms * meta_crtc_kms_from_kms_crtc (MetaKmsCrtc *kms_crtc);
+ 
+ MetaCrtcKms * meta_crtc_kms_new (MetaGpuKms  *gpu_kms,
+diff --git a/src/backends/native/meta-monitor-manager-native.c b/src/backends/native/meta-monitor-manager-native.c
+index e5a5c0ba4e7..26a5ef259c0 100644
+--- a/src/backends/native/meta-monitor-manager-native.c
++++ b/src/backends/native/meta-monitor-manager-native.c
+@@ -77,6 +77,7 @@ typedef struct _MetaMonitorManagerNativePrivate
+   gulong kms_resources_changed_handler_id;
+ 
+   GHashTable *crtc_gamma_cache;
++  GHashTable *crtc_ctm_cache;
+ 
+   gboolean needs_outputs;
+ 
+@@ -333,6 +334,42 @@ meta_monitor_manager_native_update_cached_crtc_gamma (MetaMonitorManagerNative *
+                         gamma);
+ }
+ 
++MetaCtm *
++meta_monitor_manager_native_get_cached_crtc_ctm (MetaMonitorManagerNative *manager_native,
++                                                 MetaCrtcKms              *crtc_kms)
++{
++  MetaMonitorManagerNativePrivate *priv =
++    meta_monitor_manager_native_get_instance_private (manager_native);
++  uint64_t crtc_id;
++
++  crtc_id = meta_crtc_get_id (META_CRTC (crtc_kms));
++  return g_hash_table_lookup (priv->crtc_ctm_cache,
++                              GUINT_TO_POINTER (crtc_id));
++}
++
++void
++meta_monitor_manager_native_update_cached_crtc_ctm (MetaMonitorManagerNative *manager_native,
++                                                    MetaCrtcKms              *crtc_kms,
++                                                    MetaCtm                  *ctm)
++{
++  MetaMonitorManagerNativePrivate *priv =
++    meta_monitor_manager_native_get_instance_private (manager_native);
++  MetaCrtc *crtc = META_CRTC (crtc_kms);
++  uint64_t crtc_id = meta_crtc_get_id (crtc);
++
++  if (ctm)
++    {
++      g_hash_table_replace (priv->crtc_ctm_cache,
++                            GUINT_TO_POINTER (crtc_id),
++                            ctm);
++    }
++  else
++    {
++      g_hash_table_remove (priv->crtc_ctm_cache,
++                           GUINT_TO_POINTER (crtc_id));
++    }
++}
++
+ static void
+ handle_hotplug_event (MetaMonitorManager *manager)
+ {
+@@ -601,6 +638,7 @@ meta_monitor_manager_native_dispose (GObject *object)
+ 
+   g_clear_handle_id (&priv->rebuild_virtual_idle_id, g_source_remove);
+   g_clear_pointer (&priv->crtc_gamma_cache, g_hash_table_unref);
++  g_clear_pointer (&priv->crtc_ctm_cache, g_hash_table_unref);
+ 
+   G_OBJECT_CLASS (meta_monitor_manager_native_parent_class)->dispose (object);
+ }
+@@ -653,6 +691,10 @@ meta_monitor_manager_native_initable_init (GInitable    *initable,
+     g_hash_table_new_full (NULL, NULL,
+                            NULL,
+                            (GDestroyNotify) meta_gamma_lut_free);
++  priv->crtc_ctm_cache =
++    g_hash_table_new_full (NULL, NULL,
++                           NULL,
++                           (GDestroyNotify) meta_ctm_free);
+ 
+   g_signal_connect (manager, "monitors-changed",
+                     G_CALLBACK (on_monitors_changed), NULL);
+diff --git a/src/backends/native/meta-monitor-manager-native.h b/src/backends/native/meta-monitor-manager-native.h
+index 93f2ec54eb6..5132f6a51ed 100644
+--- a/src/backends/native/meta-monitor-manager-native.h
++++ b/src/backends/native/meta-monitor-manager-native.h
+@@ -52,3 +52,10 @@ MetaGammaLut * meta_monitor_manager_native_get_cached_crtc_gamma (MetaMonitorMan
+ void meta_monitor_manager_native_update_cached_crtc_gamma (MetaMonitorManagerNative *manager_native,
+                                                            MetaCrtcKms              *crtc_kms,
+                                                            MetaGammaLut             *gamma);
++
++MetaCtm * meta_monitor_manager_native_get_cached_crtc_ctm (MetaMonitorManagerNative *manager_native,
++                                                           MetaCrtcKms              *crtc_kms);
++
++void meta_monitor_manager_native_update_cached_crtc_ctm (MetaMonitorManagerNative *manager_native,
++                                                         MetaCrtcKms              *crtc_kms,
++                                                         MetaCtm                  *ctm);
+diff --git a/src/backends/native/meta-onscreen-native.c b/src/backends/native/meta-onscreen-native.c
+index a000367d746..d1057cd0976 100644
+--- a/src/backends/native/meta-onscreen-native.c
++++ b/src/backends/native/meta-onscreen-native.c
+@@ -153,9 +153,10 @@ struct _MetaOnscreenNative
+   union {
+     struct {
+       KmsProperty gamma_lut;
++      KmsProperty ctm;
+       KmsProperty privacy_screen;
+     } property;
+-    KmsProperty properties[2];
++    KmsProperty properties[3];
+   };
+ };
+ 
+@@ -2329,6 +2330,21 @@ meta_onscreen_native_prepare_frame (CoglOnscreen *onscreen,
+         target_frame_counter;
+     }
+ 
++  if (onscreen_native->property.ctm.invalidated)
++    {
++      const MetaCtm *ctm;
++      MetaKmsUpdate *kms_update;
++
++      kms_update = meta_frame_native_ensure_kms_update (frame_native,
++                                                        kms_device);
++
++      ctm = meta_crtc_kms_peek_ctm (crtc_kms);
++      meta_kms_update_set_crtc_ctm (kms_update, kms_crtc, ctm);
++      onscreen_native->property.ctm.invalidated = FALSE;
++      onscreen_native->property.ctm.target_frame_counter =
++        target_frame_counter;
++    }
++
+   if (onscreen_native->property.privacy_screen.invalidated)
+     {
+       MetaKmsConnector *kms_connector =
+@@ -3278,6 +3294,8 @@ meta_onscreen_native_invalidate (MetaOnscreenNative *onscreen_native)
+ 
+   if (meta_crtc_get_gamma_lut_size (onscreen_native->crtc) > 0)
+     onscreen_native->property.gamma_lut.invalidated = TRUE;
++  if (meta_crtc_is_ctm_supported (onscreen_native->crtc))
++    onscreen_native->property.ctm.invalidated = TRUE;
+   if (output_info->supports_privacy_screen)
+     onscreen_native->property.privacy_screen.invalidated = TRUE;
+ }
+@@ -3292,6 +3310,16 @@ on_gamma_lut_changed (MetaCrtc           *crtc,
+   clutter_stage_view_schedule_update (stage_view);
+ }
+ 
++static void
++on_ctm_changed (MetaCrtc           *crtc,
++                MetaOnscreenNative *onscreen_native)
++{
++  ClutterStageView *stage_view = CLUTTER_STAGE_VIEW (onscreen_native->view);
++
++  onscreen_native->property.ctm.invalidated = TRUE;
++  clutter_stage_view_schedule_update (stage_view);
++}
++
+ static void
+ on_privacy_screen_enabled_changed (MetaOutput         *output,
+                                    GParamSpec         *pspec,
+@@ -3341,6 +3369,15 @@ meta_onscreen_native_new (MetaRendererNative *renderer_native,
+                           onscreen_native);
+     }
+ 
++  if (meta_crtc_is_ctm_supported (crtc))
++    {
++      onscreen_native->property.ctm.invalidated = TRUE;
++      onscreen_native->property.ctm.signal_handler_id =
++        g_signal_connect (crtc, "ctm-changed",
++                          G_CALLBACK (on_ctm_changed),
++                          onscreen_native);
++    }
++
+   if (output_info->supports_privacy_screen)
+     {
+       onscreen_native->property.privacy_screen.invalidated = TRUE;
+@@ -3358,6 +3395,8 @@ clear_invalidation_handlers (MetaOnscreenNative *onscreen_native)
+ {
+   g_clear_signal_handler (&onscreen_native->property.gamma_lut.signal_handler_id,
+                           onscreen_native->crtc);
++  g_clear_signal_handler (&onscreen_native->property.ctm.signal_handler_id,
++                          onscreen_native->crtc);
+   g_clear_signal_handler (&onscreen_native->property.privacy_screen.signal_handler_id,
+                           onscreen_native->output);
+ }
+-- 
+GitLab
+
+
+From 77a16ba70a581796d95cb08218963644562db8fd Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:51:29 +0200
+Subject: [PATCH 5/8] color-device: Apply Night Light without an assigned color
+ profile
+
+update_white_point() returned early when no colord profile was assigned
+to the device, so Night Light had no effect at all in that case, even
+though the temperature ramp does not depend on a profile: without VCGT
+data, meta_color_profile_generate_gamma_lut() ignores the profile
+entirely and produces the uncalibrated blackbody ramp.
+
+Tolerate a NULL profile instead. The VCGT branch and the brightness
+profile still require one, so calibrated setups are unaffected, and
+displays with no default profile now follow the temperature.
+
+Without a profile and at the default temperature the ramp is a
+bit-exact identity, since cd_color_get_blackbody_rgb_full() returns
+exactly (1.0, 1.0, 1.0) for 6500K. Programming it would still emit
+GAMMA_LUT_CHANGED and schedule a stage view update, queuing a KMS
+update that cannot change the output, so skip that case and track
+whether a non-identity white point is programmed to keep turning Night
+Light off clearing it.
+
+Closes: https://gitlab.gnome.org/GNOME/mutter/-/work_items/2711
+---
+ src/backends/meta-color-device.c  | 23 +++++++++++++++++++----
+ src/backends/meta-color-profile.c |  9 ++++-----
+ 2 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/src/backends/meta-color-device.c b/src/backends/meta-color-device.c
+index dfc7571b741..7fd6f6f00bf 100644
+--- a/src/backends/meta-color-device.c
++++ b/src/backends/meta-color-device.c
+@@ -82,6 +82,7 @@ struct _MetaColorDevice
+ 
+   PendingState pending_state;
+   gboolean is_ready;
++  gboolean has_white_point;
+ 
+   float reference_luminance_factor;
+ 
+@@ -1476,28 +1477,42 @@ update_white_point (MetaColorDevice *color_device)
+   MetaColorProfile *color_profile;
+   size_t lut_size;
+   unsigned int temperature;
++  gboolean is_identity;
+ 
+   if (!meta_color_device_is_ready (color_device))
+     return 0;
+ 
++  /* Night Light needs the temperature, not a profile: the uncalibrated gamma
++   * ramp works without one. Devices that have no colord profile assigned must
++   * still get the temperature applied. */
+   color_profile = meta_color_device_get_assigned_profile (color_device);
+-  if (!color_profile)
+-    return 0;
+ 
+   if (color_device->is_calibrating)
+     temperature = meta_color_manager_get_default_temperature (color_manager);
+   else
+     temperature = meta_color_manager_get_temperature (color_manager);
+ 
++  /* Without a profile the ramp comes from the temperature alone, and at the
++   * default temperature it is a bit-exact identity. Programming that would
++   * queue a KMS update that cannot change the output, so skip it unless a
++   * non-identity white point is programmed and has to be cleared. */
++  is_identity = !color_profile &&
++    temperature == meta_color_manager_get_default_temperature (color_manager);
++  if (is_identity && !color_device->has_white_point)
++    return 0;
++
++  color_device->has_white_point = !is_identity;
++
+   meta_topic (META_DEBUG_COLOR,
+               "Updating white point of device '%s' (%s) "
+               "using color profile '%s' and temperature %uK",
+               meta_color_device_get_id (color_device),
+               meta_monitor_get_connector (monitor),
+-              meta_color_profile_get_id (color_profile),
++              color_profile ? meta_color_profile_get_id (color_profile)
++                            : "(none)",
+               temperature);
+ 
+-  if (meta_monitor_is_builtin (monitor))
++  if (color_profile && meta_monitor_is_builtin (monitor))
+     {
+       const char *brightness_profile;
+ 
+diff --git a/src/backends/meta-color-profile.c b/src/backends/meta-color-profile.c
+index 08505392a29..64605042ebe 100644
+--- a/src/backends/meta-color-profile.c
++++ b/src/backends/meta-color-profile.c
+@@ -486,16 +486,15 @@ meta_color_profile_generate_gamma_lut (MetaColorProfile *color_profile,
+ {
+   g_assert (lut_size > 0);
+ 
+-  if (color_profile->calibration->has_vcgt)
++  if (color_profile && color_profile->calibration->has_vcgt)
+     {
+       return generate_gamma_lut_from_vcgt (color_profile,
+                                            color_profile->calibration->vcgt,
+                                            temperature, lut_size);
+     }
+-  else
+-    {
+-      return generate_gamma_lut (color_profile, temperature, lut_size);
+-    }
++
++  /* Uncalibrated temperature ramp; @color_profile may be NULL. */
++  return generate_gamma_lut (color_profile, temperature, lut_size);
+ }
+ 
+ void
+-- 
+GitLab
+
+
+From ae9bcea71768c5dd64dc4ad02729ee1152e59d86 Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:51:45 +0200
+Subject: [PATCH 6/8] color-device: Use CTM for Night Light when GAMMA_LUT is
+ missing
+
+Some display controllers expose the CRTC CTM property but no GAMMA_LUT,
+so Night Light has no way to reach the hardware. Apple Silicon under the
+apple-dcp driver is the case this was written for.
+
+When the monitor has no gamma LUT but its CRTC supports CTM, build a
+diagonal matrix from the same blackbody RGB scales the uncalibrated gamma
+ramp uses, and program that instead. GAMMA_LUT stays preferred whenever
+it exists, so behaviour on hardware that has one is unchanged, and only
+the Night Light temperature is expressed this way: no other part of the
+color pipeline moves to CTM.
+
+This mirrors what KWin does, see commits 114032d2 and f2417a85
+("backends/drm: support CTM for simple color transformations").
+---
+ src/backends/meta-color-device.c | 37 ++++++++++++++++++++++++++++----
+ 1 file changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/src/backends/meta-color-device.c b/src/backends/meta-color-device.c
+index 7fd6f6f00bf..5d8f5306ea7 100644
+--- a/src/backends/meta-color-device.c
++++ b/src/backends/meta-color-device.c
+@@ -29,6 +29,7 @@
+ #include "backends/meta-color-manager-private.h"
+ #include "backends/meta-color-profile.h"
+ #include "backends/meta-color-store.h"
++#include "backends/meta-crtc.h"
+ #include "backends/meta-monitor-private.h"
+ #include "core/meta-debug-control-private.h"
+ 
+@@ -1478,13 +1479,14 @@ update_white_point (MetaColorDevice *color_device)
+   size_t lut_size;
+   unsigned int temperature;
+   gboolean is_identity;
++  gboolean applied = FALSE;
+ 
+   if (!meta_color_device_is_ready (color_device))
+     return 0;
+ 
+-  /* Night Light needs the temperature, not a profile: the uncalibrated gamma
+-   * ramp works without one. Devices that have no colord profile assigned must
+-   * still get the temperature applied. */
++  /* Night Light needs the temperature, not a profile: both the uncalibrated
++   * gamma ramp and the CTM fallback work without one. Devices that have no
++   * colord profile assigned must still get the temperature applied. */
+   color_profile = meta_color_device_get_assigned_profile (color_device);
+ 
+   if (color_device->is_calibrating)
+@@ -1533,14 +1535,41 @@ update_white_point (MetaColorDevice *color_device)
+     {
+       g_autoptr (MetaGammaLut) lut = NULL;
+ 
++      /* Prefer GAMMA_LUT whenever the hardware exposes it, even without a
++       * profile (uncalibrated blackbody ramp), and never fall back to CTM. */
+       lut = meta_color_profile_generate_gamma_lut (color_profile,
+                                                    temperature,
+                                                    lut_size);
+ 
+       meta_monitor_set_gamma_lut (monitor, lut);
++      applied = TRUE;
++    }
++  else if (meta_monitor_is_ctm_supported (monitor))
++    {
++      float red_scale, green_scale, blue_scale;
++      g_autoptr (MetaCtm) ctm = NULL;
++
++      /* Only reached when GAMMA_LUT is unavailable: a diagonal matrix built
++       * from the same blackbody RGB scales the uncalibrated gamma path uses.
++       * No ICC profile is needed, the scales come only from the temperature. */
++      meta_color_get_temperature_rgb_scales (temperature,
++                                             &red_scale,
++                                             &green_scale,
++                                             &blue_scale);
++
++      meta_topic (META_DEBUG_COLOR,
++                  "Falling back to CTM on '%s' (no GAMMA_LUT); scales "
++                  "(%.3f, %.3f, %.3f) for %uK",
++                  meta_color_device_get_id (color_device),
++                  red_scale, green_scale, blue_scale,
++                  temperature);
++
++      ctm = meta_ctm_new_from_rgb_scales (red_scale, green_scale, blue_scale);
++      meta_monitor_set_ctm (monitor, ctm);
++      applied = TRUE;
+     }
+ 
+-  return UPDATE_RESULT_CALIBRATION;
++  return applied ? UPDATE_RESULT_CALIBRATION : 0;
+ }
+ 
+ static void
+-- 
+GitLab
+
+
+From 3bc6e845dbc45b28be92f3b184c50ce0677b7a08 Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:52:00 +0200
+Subject: [PATCH 7/8] monitor-manager: Treat CTM as a Night Light capability
+
+NightLightSupported only considered the gamma LUT size, so Settings hid
+the Night Light panel on hardware where the CTM fallback can drive it.
+Report the capability when any CRTC has either a gamma LUT or CTM, which
+matches what update_white_point() is able to program.
+
+Closes: https://gitlab.gnome.org/GNOME/mutter/-/issues/2318
+---
+ src/backends/meta-monitor-manager.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/backends/meta-monitor-manager.c b/src/backends/meta-monitor-manager.c
+index 471e1efe56d..8e3ce73ba2b 100644
+--- a/src/backends/meta-monitor-manager.c
++++ b/src/backends/meta-monitor-manager.c
+@@ -1207,7 +1207,8 @@ update_night_light_supported (MetaMonitorManager *manager)
+         {
+           MetaCrtc *crtc = l_crtc->data;
+ 
+-          if (meta_crtc_get_gamma_lut_size (crtc) > 0)
++          if (meta_crtc_get_gamma_lut_size (crtc) > 0 ||
++              meta_crtc_is_ctm_supported (crtc))
+             {
+               night_light_supported = TRUE;
+               break;
+-- 
+GitLab
+
+
+From d21f178f60fccd516a87f1b7cb20417d0422b4c1 Mon Sep 17 00:00:00 2001
+From: onetr1ck <wilhelm.arngold@proton.me>
+Date: Thu, 30 Jul 2026 14:52:00 +0200
+Subject: [PATCH 8/8] tests: Cover Night Light GAMMA_LUT preference and CTM
+ fallback
+
+Teach MetaCrtcTest about CTM so the color management tests can describe
+a CRTC with CTM but no gamma LUT, and add four cases:
+
+- prefer-gamma-lut: a CRTC exposing both must program the LUT and leave
+  the CTM untouched, which is the property the fallback must never break
+- ctm-fallback: a CRTC with only CTM gets a diagonal matrix carrying the
+  blackbody scales for the temperature, with no color profile assigned
+- ctm-scale-clamping: out of range and non-finite scales are clamped, so
+  nothing outside [0, 1] can reach the kernel
+- supported: NightLightSupported follows CTM capability, and is still
+  reported for a gamma-only CRTC
+
+The two hardware cases drive the real path from the gsd-color temperature
+down to the CRTC. Each test picks temperatures no other test leaves
+behind, since the color manager only acts on a temperature that actually
+changed, and the wait for that update is bounded: these tests have no
+color profile assigned, so a regression that makes the update bail out
+early emits nothing, which would otherwise surface as an unexplained
+suite timeout rather than a named failure.
+---
+ src/tests/color-management-tests.c  | 339 ++++++++++++++++++++++++++++
+ src/tests/meta-crtc-test.c          |  34 +++
+ src/tests/meta-crtc-test.h          |   9 +
+ src/tests/meta-monitor-test-utils.c |   2 +
+ src/tests/meta-monitor-test-utils.h |   1 +
+ 5 files changed, 385 insertions(+)
+
+diff --git a/src/tests/color-management-tests.c b/src/tests/color-management-tests.c
+index 1074b45d875..96c7e907d7f 100644
+--- a/src/tests/color-management-tests.c
++++ b/src/tests/color-management-tests.c
+@@ -19,10 +19,14 @@
+ #include "config.h"
+ 
+ #include <fcntl.h>
++#include <math.h>
+ 
+ #include "backends/meta-color-device.h"
+ #include "backends/meta-color-manager-private.h"
+ #include "backends/meta-color-profile.h"
++#include "backends/meta-crtc.h"
++#include "backends/meta-monitor-manager-private.h"
++#include "backends/meta-monitor-private.h"
+ #include "meta-test/meta-context-test.h"
+ #include "tests/meta-crtc-test.h"
+ #include "tests/meta-monitor-test-utils.h"
+@@ -1404,6 +1408,333 @@ meta_test_color_management_night_light_uncalibrated (void)
+                       crtc_test->gamma.size);
+ }
+ 
++static void
++assert_ctm_scales (const MetaCtm *ctm,
++                   float          expected_r,
++                   float          expected_g,
++                   float          expected_b)
++{
++  const double scale = (double) ((uint64_t) 1 << 32);
++  double r, g, b;
++  int i;
++
++  g_assert_nonnull (ctm);
++
++  r = (double) ctm->matrix[0] / scale;
++  g = (double) ctm->matrix[4] / scale;
++  b = (double) ctm->matrix[8] / scale;
++
++  g_assert_cmpfloat_with_epsilon (r, expected_r, 0.002);
++  g_assert_cmpfloat_with_epsilon (g, expected_g, 0.002);
++  g_assert_cmpfloat_with_epsilon (b, expected_b, 0.002);
++
++  for (i = 0; i < 9; i++)
++    {
++      if (i == 0 || i == 4 || i == 8)
++        continue;
++      g_assert_cmpuint (ctm->matrix[i], ==, 0);
++    }
++}
++
++/*
++ * The uncalibrated Night Light ramp is a linear ramp scaled by the blackbody
++ * factors, so the last entry of each channel is 0xffff times the scale.
++ */
++static void
++assert_gamma_lut_scales (MetaCrtcTest *crtc_test,
++                         float         expected_r,
++                         float         expected_g,
++                         float         expected_b)
++{
++  const double max = 0xffff;
++  size_t last;
++
++  g_assert_cmpuint (crtc_test->gamma.size, >, 0);
++  last = crtc_test->gamma.size - 1;
++
++  g_assert_cmpfloat_with_epsilon (crtc_test->gamma.red[last] / max,
++                                  expected_r, 0.002);
++  g_assert_cmpfloat_with_epsilon (crtc_test->gamma.green[last] / max,
++                                  expected_g, 0.002);
++  g_assert_cmpfloat_with_epsilon (crtc_test->gamma.blue[last] / max,
++                                  expected_b, 0.002);
++}
++
++/*
++ * Applying a temperature is only observable when it differs from the one
++ * currently held by the color manager, which is process wide and therefore
++ * carried over between tests. Every test below picks temperatures no other
++ * test leaves behind, so each change reliably triggers an update.
++ *
++ * Note that only the Temperature property is followed: gsd-color reports the
++ * default temperature when Night Light is inactive.
++ */
++static gboolean
++on_calibration_wait_timeout (gpointer user_data)
++{
++  gboolean *timed_out = user_data;
++
++  *timed_out = TRUE;
++
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++apply_night_light_temperature (MetaColorDevice *color_device,
++                               unsigned int     temperature,
++                               gboolean         active)
++{
++  gboolean run = TRUE;
++  gboolean timed_out = FALSE;
++  gulong handler_id;
++  guint timeout_id;
++
++  handler_id = g_signal_connect (color_device, "calibration-changed",
++                                 G_CALLBACK (on_device_calibration_changed),
++                                 &run);
++  /*
++   * Bounded, unlike wait_for_device_calibration_changed(): these tests have no
++   * color profile assigned, so a regression that makes the white point update
++   * bail out early emits nothing at all. Waiting forever would surface that as
++   * an unexplained suite timeout instead of a failure naming the cause.
++   */
++  timeout_id = g_timeout_add_seconds (10, on_calibration_wait_timeout,
++                                      &timed_out);
++
++  set_night_light_temperature (temperature);
++  set_night_light_active (active);
++
++  while (run && !timed_out)
++    g_main_context_iteration (NULL, TRUE);
++
++  g_clear_handle_id (&timeout_id, g_source_remove);
++  g_signal_handler_disconnect (color_device, handler_id);
++
++  if (timed_out)
++    g_error ("Timed out waiting for %uK to be applied: the color device "
++             "emitted no calibration change", temperature);
++}
++
++static void
++meta_test_color_management_night_light_prefer_gamma_lut (void)
++{
++  MetaBackend *backend = meta_context_get_backend (test_context);
++  MetaMonitorManager *monitor_manager =
++    meta_backend_get_monitor_manager (backend);
++  MetaMonitorManagerTest *monitor_manager_test =
++    META_MONITOR_MANAGER_TEST (monitor_manager);
++  MetaColorManager *color_manager =
++    meta_backend_get_color_manager (backend);
++  MonitorTestCaseSetup test_case_setup = base_monitor_setup;
++  MetaMonitorTestSetup *test_setup;
++  MetaMonitor *monitor;
++  MetaOutput *output;
++  MetaCrtc *crtc;
++  MetaCrtcTest *crtc_test;
++  MetaColorDevice *color_device;
++  float expected_r, expected_g, expected_b;
++  unsigned int temperature = 4000;
++
++  /* Hardware exposing both GAMMA_LUT and CTM must keep using the LUT. */
++  test_case_setup.crtcs[0].enable_ctm = TRUE;
++  test_case_setup.outputs[0].edid_info = CALTECH_MONITOR_EDID;
++  test_case_setup.outputs[0].has_edid_info = TRUE;
++  test_case_setup.n_outputs = 1;
++  test_case_setup.n_crtcs = 1;
++
++  test_setup = meta_create_monitor_test_setup (backend, &test_case_setup,
++                                               MONITOR_TEST_FLAG_NO_STORED);
++  meta_monitor_manager_test_emulate_hotplug (monitor_manager_test, test_setup);
++
++  monitor = meta_monitor_manager_get_monitors (monitor_manager)->data;
++  g_assert_cmpuint (meta_monitor_get_gamma_lut_size (monitor), >, 0);
++  g_assert_true (meta_monitor_is_ctm_supported (monitor));
++
++  color_device = meta_color_manager_get_color_device (color_manager, monitor);
++  g_assert_nonnull (color_device);
++
++  while (!meta_color_device_is_ready (color_device))
++    g_main_context_iteration (NULL, TRUE);
++
++  output = meta_monitor_get_main_output (monitor);
++  crtc = meta_output_get_assigned_crtc (output);
++  crtc_test = META_CRTC_TEST (crtc);
++
++  /* No colord profile is assigned, so this is the uncalibrated ramp. */
++  apply_night_light_temperature (color_device, temperature, TRUE);
++
++  meta_color_get_temperature_rgb_scales (temperature,
++                                         &expected_r,
++                                         &expected_g,
++                                         &expected_b);
++  assert_gamma_lut_scales (crtc_test, expected_r, expected_g, expected_b);
++  g_assert_null (meta_crtc_test_peek_ctm (crtc_test));
++
++  /* Back to daylight; still no CTM. */
++  apply_night_light_temperature (color_device, 6500, FALSE);
++
++  meta_color_get_temperature_rgb_scales (6500,
++                                         &expected_r,
++                                         &expected_g,
++                                         &expected_b);
++  assert_gamma_lut_scales (crtc_test, expected_r, expected_g, expected_b);
++  g_assert_null (meta_crtc_test_peek_ctm (crtc_test));
++}
++
++static void
++meta_test_color_management_night_light_ctm_fallback (void)
++{
++  MetaBackend *backend = meta_context_get_backend (test_context);
++  MetaMonitorManager *monitor_manager =
++    meta_backend_get_monitor_manager (backend);
++  MetaMonitorManagerTest *monitor_manager_test =
++    META_MONITOR_MANAGER_TEST (monitor_manager);
++  MetaColorManager *color_manager =
++    meta_backend_get_color_manager (backend);
++  MonitorTestCaseSetup test_case_setup = base_monitor_setup;
++  MetaMonitorTestSetup *test_setup;
++  MetaMonitor *monitor;
++  MetaOutput *output;
++  MetaCrtc *crtc;
++  MetaCrtcTest *crtc_test;
++  MetaColorDevice *color_device;
++  float expected_r, expected_g, expected_b;
++  unsigned int temperature = 4700;
++
++  /* No GAMMA_LUT, but CTM available. */
++  test_case_setup.crtcs[0].disable_gamma_lut = TRUE;
++  test_case_setup.crtcs[0].enable_ctm = TRUE;
++  test_case_setup.outputs[0].edid_info = CALTECH_MONITOR_EDID;
++  test_case_setup.outputs[0].has_edid_info = TRUE;
++  test_case_setup.n_outputs = 1;
++  test_case_setup.n_crtcs = 1;
++
++  test_setup = meta_create_monitor_test_setup (backend, &test_case_setup,
++                                               MONITOR_TEST_FLAG_NO_STORED);
++  meta_monitor_manager_test_emulate_hotplug (monitor_manager_test, test_setup);
++
++  monitor = meta_monitor_manager_get_monitors (monitor_manager)->data;
++  g_assert_cmpuint (meta_monitor_get_gamma_lut_size (monitor), ==, 0);
++  g_assert_true (meta_monitor_is_ctm_supported (monitor));
++
++  color_device = meta_color_manager_get_color_device (color_manager, monitor);
++  g_assert_nonnull (color_device);
++
++  while (!meta_color_device_is_ready (color_device))
++    g_main_context_iteration (NULL, TRUE);
++
++  /* No profile is assigned, which is the case the fallback has to work in:
++   * requiring one used to make Night Light do nothing at all here. */
++  g_assert_null (meta_color_device_get_assigned_profile (color_device));
++
++  output = meta_monitor_get_main_output (monitor);
++  crtc = meta_output_get_assigned_crtc (output);
++  crtc_test = META_CRTC_TEST (crtc);
++
++  /* A warm temperature becomes a diagonal CTM built from the blackbody
++   * scales, without needing a color profile. */
++  apply_night_light_temperature (color_device, temperature, TRUE);
++
++  meta_color_get_temperature_rgb_scales (temperature,
++                                         &expected_r,
++                                         &expected_g,
++                                         &expected_b);
++  assert_ctm_scales (meta_crtc_test_peek_ctm (crtc_test),
++                     expected_r, expected_g, expected_b);
++
++  /* Back to daylight. */
++  apply_night_light_temperature (color_device, 6500, FALSE);
++
++  meta_color_get_temperature_rgb_scales (6500,
++                                         &expected_r,
++                                         &expected_g,
++                                         &expected_b);
++  assert_ctm_scales (meta_crtc_test_peek_ctm (crtc_test),
++                     expected_r, expected_g, expected_b);
++}
++
++/*
++ * Nothing outside [0, 1] may reach the kernel, whatever the scales are, so
++ * check the boundaries of the conversion directly rather than only through a
++ * temperature that happens to produce sane values.
++ */
++static void
++meta_test_color_management_ctm_scale_clamping (void)
++{
++  g_autoptr (MetaCtm) out_of_range = NULL;
++  g_autoptr (MetaCtm) non_finite = NULL;
++  g_autoptr (MetaCtm) boundaries = NULL;
++
++  out_of_range = meta_ctm_new_from_rgb_scales (-1.0f, 2.0f, 0.5f);
++  assert_ctm_scales (out_of_range, 0.0f, 1.0f, 0.5f);
++
++  non_finite = meta_ctm_new_from_rgb_scales (NAN, INFINITY, -INFINITY);
++  assert_ctm_scales (non_finite, 0.0f, 0.0f, 0.0f);
++
++  boundaries = meta_ctm_new_from_rgb_scales (0.0f, 1.0f, 0.0f);
++  assert_ctm_scales (boundaries, 0.0f, 1.0f, 0.0f);
++}
++
++/*
++ * The generated D-Bus accessors are not exported from libmutter, so read the
++ * property off the skeleton directly.
++ */
++static gboolean
++get_night_light_supported (MetaMonitorManager *monitor_manager)
++{
++  gboolean supported = FALSE;
++
++  g_object_get (monitor_manager->display_config,
++                "night-light-supported", &supported,
++                NULL);
++
++  return supported;
++}
++
++/*
++ * NightLightSupported must follow CTM capability, otherwise the toggle stays
++ * hidden on exactly the hardware this series targets.
++ */
++static void
++meta_test_color_management_night_light_supported (void)
++{
++  MetaBackend *backend = meta_context_get_backend (test_context);
++  MetaMonitorManager *monitor_manager =
++    meta_backend_get_monitor_manager (backend);
++  MetaMonitorManagerTest *monitor_manager_test =
++    META_MONITOR_MANAGER_TEST (monitor_manager);
++  MonitorTestCaseSetup test_case_setup = base_monitor_setup;
++  MetaMonitorTestSetup *test_setup;
++
++  test_case_setup.outputs[0].edid_info = CALTECH_MONITOR_EDID;
++  test_case_setup.outputs[0].has_edid_info = TRUE;
++  test_case_setup.n_outputs = 1;
++  test_case_setup.n_crtcs = 1;
++
++  /* Neither property: Night Light cannot be applied at all. */
++  test_case_setup.crtcs[0].disable_gamma_lut = TRUE;
++  test_case_setup.crtcs[0].enable_ctm = FALSE;
++  test_setup = meta_create_monitor_test_setup (backend, &test_case_setup,
++                                               MONITOR_TEST_FLAG_NO_STORED);
++  meta_monitor_manager_test_emulate_hotplug (monitor_manager_test, test_setup);
++  g_assert_false (get_night_light_supported (monitor_manager));
++
++  /* CTM only: still supported, via the fallback. */
++  test_case_setup.crtcs[0].enable_ctm = TRUE;
++  test_setup = meta_create_monitor_test_setup (backend, &test_case_setup,
++                                               MONITOR_TEST_FLAG_NO_STORED);
++  meta_monitor_manager_test_emulate_hotplug (monitor_manager_test, test_setup);
++  g_assert_true (get_night_light_supported (monitor_manager));
++
++  /* GAMMA_LUT only: unchanged behaviour. */
++  test_case_setup.crtcs[0].disable_gamma_lut = FALSE;
++  test_case_setup.crtcs[0].enable_ctm = FALSE;
++  test_setup = meta_create_monitor_test_setup (backend, &test_case_setup,
++                                               MONITOR_TEST_FLAG_NO_STORED);
++  meta_monitor_manager_test_emulate_hotplug (monitor_manager_test, test_setup);
++  g_assert_true (get_night_light_supported (monitor_manager));
++}
++
+ static MetaMonitorTestSetup *
+ create_stage_view_test_setup (MetaBackend *backend)
+ {
+@@ -1464,6 +1795,14 @@ init_tests (void)
+                   meta_test_color_management_night_light_calibrated);
+   add_color_test ("/color-management/night-light/uncalibrated",
+                   meta_test_color_management_night_light_uncalibrated);
++  add_color_test ("/color-management/night-light/prefer-gamma-lut",
++                  meta_test_color_management_night_light_prefer_gamma_lut);
++  add_color_test ("/color-management/night-light/ctm-fallback",
++                  meta_test_color_management_night_light_ctm_fallback);
++  add_color_test ("/color-management/night-light/ctm-scale-clamping",
++                  meta_test_color_management_ctm_scale_clamping);
++  add_color_test ("/color-management/night-light/supported",
++                  meta_test_color_management_night_light_supported);
+ }
+ 
+ int
+diff --git a/src/tests/meta-crtc-test.c b/src/tests/meta-crtc-test.c
+index 98f78fa291f..273c9363ebc 100644
+--- a/src/tests/meta-crtc-test.c
++++ b/src/tests/meta-crtc-test.c
+@@ -19,6 +19,8 @@
+ 
+ #include "tests/meta-crtc-test.h"
+ 
++#include "backends/meta-crtc.h"
++
+ #define GAMMA_SIZE 256
+ 
+ G_DEFINE_TYPE (MetaCrtcTest, meta_crtc_test, META_TYPE_CRTC_NATIVE)
+@@ -31,6 +33,23 @@ meta_crtc_test_get_gamma_lut_size (MetaCrtc *crtc)
+   return crtc_test->gamma.size;
+ }
+ 
++static gboolean
++meta_crtc_test_is_ctm_supported (MetaCrtc *crtc)
++{
++  return META_CRTC_TEST (crtc)->ctm_supported;
++}
++
++static void
++meta_crtc_test_set_ctm (MetaCrtc      *crtc,
++                        const MetaCtm *ctm)
++{
++  MetaCrtcTest *crtc_test = META_CRTC_TEST (crtc);
++
++  g_clear_pointer (&crtc_test->ctm, meta_ctm_free);
++  if (ctm)
++    crtc_test->ctm = meta_ctm_copy (ctm);
++}
++
+ static MetaGammaLut *
+ meta_crtc_test_get_gamma_lut (MetaCrtc *crtc)
+ {
+@@ -99,6 +118,7 @@ meta_crtc_test_finalize (GObject *object)
+   g_free (crtc_test->gamma.red);
+   g_free (crtc_test->gamma.green);
+   g_free (crtc_test->gamma.blue);
++  g_clear_pointer (&crtc_test->ctm, meta_ctm_free);
+ 
+   G_OBJECT_CLASS (meta_crtc_test_parent_class)->finalize (object);
+ }
+@@ -115,6 +135,8 @@ meta_crtc_test_class_init (MetaCrtcTestClass *klass)
+   crtc_class->get_gamma_lut_size = meta_crtc_test_get_gamma_lut_size;
+   crtc_class->get_gamma_lut = meta_crtc_test_get_gamma_lut;
+   crtc_class->set_gamma_lut = meta_crtc_test_set_gamma_lut;
++  crtc_class->is_ctm_supported = meta_crtc_test_is_ctm_supported;
++  crtc_class->set_ctm = meta_crtc_test_set_ctm;
+ 
+   crtc_native_class->is_transform_handled =
+     meta_crtc_test_is_transform_handled;
+@@ -156,6 +178,18 @@ meta_crtc_test_disable_gamma_lut (MetaCrtcTest *crtc_test)
+   g_clear_pointer (&crtc_test->gamma.blue, g_free);
+ }
+ 
++void
++meta_crtc_test_enable_ctm (MetaCrtcTest *crtc_test)
++{
++  crtc_test->ctm_supported = TRUE;
++}
++
++const MetaCtm *
++meta_crtc_test_peek_ctm (MetaCrtcTest *crtc_test)
++{
++  return crtc_test->ctm;
++}
++
+ void
+ meta_crtc_test_set_is_transform_handled (MetaCrtcTest *crtc_test,
+                                          gboolean      handles_transforms)
+diff --git a/src/tests/meta-crtc-test.h b/src/tests/meta-crtc-test.h
+index 7590bc0d4b3..4bf373470e1 100644
+--- a/src/tests/meta-crtc-test.h
++++ b/src/tests/meta-crtc-test.h
+@@ -30,6 +30,9 @@ struct _MetaCrtcTest
+     uint16_t *blue;
+   } gamma;
+ 
++  gboolean ctm_supported;
++  MetaCtm *ctm;
++
+   gboolean handles_transforms;
+ };
+ 
+@@ -42,5 +45,11 @@ G_DECLARE_FINAL_TYPE (MetaCrtcTest, meta_crtc_test,
+ META_EXPORT
+ void meta_crtc_test_disable_gamma_lut (MetaCrtcTest *crtc_test);
+ 
++META_EXPORT
++void meta_crtc_test_enable_ctm (MetaCrtcTest *crtc_test);
++
++META_EXPORT
++const MetaCtm * meta_crtc_test_peek_ctm (MetaCrtcTest *crtc_test);
++
+ void meta_crtc_test_set_is_transform_handled (MetaCrtcTest *crtc_test,
+                                               gboolean      handles_transforms);
+diff --git a/src/tests/meta-monitor-test-utils.c b/src/tests/meta-monitor-test-utils.c
+index 39174c87535..20f87bf2a46 100644
+--- a/src/tests/meta-monitor-test-utils.c
++++ b/src/tests/meta-monitor-test-utils.c
+@@ -706,6 +706,8 @@ meta_create_monitor_test_setup (MetaBackend          *backend,
+                            NULL);
+       if (setup->crtcs[i].disable_gamma_lut)
+         meta_crtc_test_disable_gamma_lut (META_CRTC_TEST (crtc));
++      if (setup->crtcs[i].enable_ctm)
++        meta_crtc_test_enable_ctm (META_CRTC_TEST (crtc));
+ 
+       test_setup->crtcs = g_list_append (test_setup->crtcs, crtc);
+     }
+diff --git a/src/tests/meta-monitor-test-utils.h b/src/tests/meta-monitor-test-utils.h
+index 7b2beadd6ed..c0781be5ae1 100644
+--- a/src/tests/meta-monitor-test-utils.h
++++ b/src/tests/meta-monitor-test-utils.h
+@@ -128,6 +128,7 @@ typedef struct _MonitorTestCaseCrtc
+ {
+   int current_mode;
+   gboolean disable_gamma_lut;
++  gboolean enable_ctm;
+ } MonitorTestCaseCrtc;
+ 
+ typedef struct _MonitorTestCaseSetup
+-- 
+GitLab
