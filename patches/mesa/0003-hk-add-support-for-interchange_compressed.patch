@@ -1,4 +1,4 @@
-From 528ef17ca0e26981b2b6e603bbaf2a501c009a22 Mon Sep 17 00:00:00 2001
+From fb68b1dd3bad6dfe75abc6254d8e955c68a2219a Mon Sep 17 00:00:00 2001
 From: Oliver Bestmann <oliver.bestmann@googlemail.com>
 Date: Sun, 8 Feb 2026 12:53:06 +0100
 Subject: [PATCH 3/3] hk: add support for interchange_compressed
@@ -10,7 +10,7 @@ Subject: [PATCH 3/3] hk: add support for interchange_compressed
  3 files changed, 33 insertions(+), 3 deletions(-)
 
 diff --git a/src/asahi/vulkan/hk_format.c b/src/asahi/vulkan/hk_format.c
-index 006e3cd05a4..6e65661474e 100644
+index 28c2b4952f4..01e91070167 100644
 --- a/src/asahi/vulkan/hk_format.c
 +++ b/src/asahi/vulkan/hk_format.c
 @@ -15,15 +15,32 @@
@@ -64,10 +64,10 @@ index 006e3cd05a4..6e65661474e 100644
        return props->linearTilingFeatures;
     else
 diff --git a/src/asahi/vulkan/hk_image.c b/src/asahi/vulkan/hk_image.c
-index 313655723df..fc9ee0a2ae1 100644
+index 6a01a058b71..056fa67d477 100644
 --- a/src/asahi/vulkan/hk_image.c
 +++ b/src/asahi/vulkan/hk_image.c
-@@ -749,6 +749,9 @@ modifier_get_score(uint64_t mod)
+@@ -758,6 +758,9 @@ modifier_get_score(uint64_t mod)
  {
     switch (mod) {
     case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
@@ -77,7 +77,7 @@ index 313655723df..fc9ee0a2ae1 100644
        return 10;
  
     case DRM_FORMAT_MOD_APPLE_GPU_TILED:
-@@ -777,8 +780,7 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
+@@ -786,8 +789,7 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
     }
  
     for (uint32_t i = 0; i < modifier_count; ++i) {
@@ -112,5 +112,5 @@ index 27e13e73832..cd7a561ca9a 100644
              assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
              cfg.layers = layers;
 -- 
-2.54.0
+2.55.0
 

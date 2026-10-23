@@ -1,12 +1,5 @@
 { ... }:
 {
-  boot.kernelPatches = [
-    {
-      name = "apple: enable interchange compression modifier";
-      patch = ./patches/linux/0001-drm-apple-support-interchange-compression.patch;
-    }
-  ];
-
   nixpkgs.overlays = [
     (final: prev: {
       mesa = prev.mesa.overrideAttrs (
@@ -64,6 +57,21 @@
                 # i've collapsed the patches into a single patch
                 ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.4.patch
                 ./patches/mutter/5205-ctm-support-50.4.patch
+              ];
+              "50.5" = [
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.5.patch
+                ./patches/mutter/5205-ctm-support-50.5.patch
+              ];
+              "50.6" = [
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-50.6.patch
+                ./patches/mutter/5205-ctm-support-50.6.patch
+              ];
+              # ctm support is upstream since 51.0
+              "51.0" = [
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-51.0.patch
+              ];
+              "51.1" = [
+                ./patches/mutter/0001-backends-native-Move-cursor-to-overlay-plane-51.1.patch
               ];
             };
           in

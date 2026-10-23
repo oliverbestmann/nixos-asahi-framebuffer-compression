@@ -1,4 +1,4 @@
-From 9317d56f2a18a1d0b3f7b915aca3fed68a3723aa Mon Sep 17 00:00:00 2001
+From 01d594487ff1d0606bbd234b9a406b9e981d52a7 Mon Sep 17 00:00:00 2001
 From: Oliver Bestmann <oliver.bestmann@googlemail.com>
 Date: Thu, 5 Feb 2026 18:55:02 +0100
 Subject: [PATCH 2/3] asahi: add support for interchange_compressed
@@ -181,7 +181,7 @@ index bf7dfb9a6da..a2c5b9fca49 100644
  
     UNREACHABLE("Invalid tiling");
 diff --git a/src/gallium/drivers/asahi/agx_pipe.c b/src/gallium/drivers/asahi/agx_pipe.c
-index 61cb3d9e53b..df9ebae7f82 100644
+index ab205bf1fd3..5913ca42749 100644
 --- a/src/gallium/drivers/asahi/agx_pipe.c
 +++ b/src/gallium/drivers/asahi/agx_pipe.c
 @@ -57,6 +57,7 @@
@@ -255,7 +255,7 @@ index 61cb3d9e53b..df9ebae7f82 100644
     if (agx_twiddled_allowed(pres) &&
         drm_find_modifier(DRM_FORMAT_MOD_APPLE_GPU_TILED, modifiers, count))
 diff --git a/src/gallium/drivers/asahi/agx_state.c b/src/gallium/drivers/asahi/agx_state.c
-index c2784427e38..a1231e42388 100644
+index 616dd6d1c01..00d596d09ca 100644
 --- a/src/gallium/drivers/asahi/agx_state.c
 +++ b/src/gallium/drivers/asahi/agx_state.c
 @@ -737,6 +737,9 @@ agx_pack_texture(void *out, struct agx_resource *rsrc,
@@ -279,5 +279,5 @@ index c2784427e38..a1231e42388 100644
              assert((tex->layout.tiling != AIL_TILING_LINEAR) || (layers == 1));
              cfg.layers = layers;
 -- 
-2.54.0
+2.55.0
 
